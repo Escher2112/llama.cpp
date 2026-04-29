@@ -50,6 +50,15 @@ Orchestrator::Orchestrator(const OrchestratorConfig &  config,
     embedding_window_.reserve(config.embedding_window_tokens);
     scratch_top_.resize(config.l1_prefetch_top_k);
     last_topk_indices_.resize((size_t)n_layers);
+
+    if (!config_.dump_trace_path.empty()) {
+        trace_buf_.resize((size_t)n_layers);
+        _trace_open();
+    }
+}
+
+Orchestrator::~Orchestrator() {
+    _trace_finalize();
 }
 
 double Orchestrator::l1_predictor_avg_ms() const {
@@ -114,6 +123,7 @@ void Orchestrator::on_routing(int32_t layer, const int32_t * indices, int32_t co
     for (int32_t i = 0; i < count; i++) {
         cache_.access(layer, indices[i]);
     }
+
 }
 
 void Orchestrator::on_routing_weights(int32_t layer, const float * weights, int32_t count) {
@@ -139,6 +149,143 @@ void Orchestrator::_refresh_l2() {
 
     // (Not yet implemented — see TODO in ctor.)
     l2_predictor_calls_++;
+}
+
+// ============================================================================
+// Trace dumper — writes a binary file used by the offline predictor training
+// pipeline. Format (little-endian):
+//
+//   Header (32 bytes):
+//     char     magic[4]      = "MTRC"
+//     uint32   version       = 1
+//     uint32   n_layers
+//     uint32   hidden_dim
+//     uint32   top_k          (0 in header until first record; stamped after)
+//     uint32   reserved       = 0
+//     uint64   n_records      (filled in at close)
+//
+//   Each record (fixed size = 8 + 2*hidden_dim + 4*top_k + 4*top_k bytes):
+//     int32    layer
+//     int32    n_topk_actual
+//     fp16[hidden_dim]  hidden_state
+//     int32[top_k]      indices       (padded with -1 if n_topk_actual < top_k)
+//     fp32[top_k]       weights       (padded with 0 if n_topk_actual < top_k)
+//
+// On a top_k=8 model with hidden_dim=2048: each record = 4168 bytes. With
+// hidden_dim=4096 (235B): 8264 bytes.
+// ============================================================================
+
+static uint16_t fp16_from_fp32(float f) {
+    // Naive scalar fp32 → fp16. Same as the predictor uses but inverted.
+    // We don't need denormals or rounding subtleties here — training uses
+    // fp32 widening for the GEMMs anyway.
+    union { float f; uint32_t u; } v{f};
+    const uint32_t sign = (v.u >> 31) & 0x1;
+    const int32_t  exp  = ((v.u >> 23) & 0xFF) - 127 + 15;
+    const uint32_t mant =  (v.u >>  13) & 0x3FF;
+    if (exp <= 0) {
+        return (uint16_t)(sign << 15);  // underflow to signed zero
+    }
+    if (exp >= 31) {
+        return (uint16_t)((sign << 15) | (0x1F << 10));  // saturate to inf
+    }
+    return (uint16_t)((sign << 15) | (exp << 10) | mant);
+}
+
+void Orchestrator::_trace_open() {
+    trace_fp_ = std::fopen(config_.dump_trace_path.c_str(), "wb");
+    if (!trace_fp_) {
+        std::fprintf(stderr, "[orchestrator] trace dump: failed to open %s\n",
+                     config_.dump_trace_path.c_str());
+        return;
+    }
+    // Reserve header. We rewrite it on close once n_records and top_k are known.
+    char header[32] = {0};
+    std::memcpy(header, "MTRC", 4);
+    *reinterpret_cast<uint32_t *>(header +  4) = 1;                       // version
+    *reinterpret_cast<uint32_t *>(header +  8) = (uint32_t)n_layers_;
+    *reinterpret_cast<uint32_t *>(header + 12) = (uint32_t)hidden_dim_;
+    *reinterpret_cast<uint32_t *>(header + 16) = 0;                       // top_k (filled later)
+    *reinterpret_cast<uint32_t *>(header + 20) = 0;                       // reserved
+    *reinterpret_cast<uint64_t *>(header + 24) = 0;                       // n_records
+    std::fwrite(header, 1, 32, trace_fp_);
+    std::fprintf(stderr, "[orchestrator] trace dump opened: %s\n",
+                 config_.dump_trace_path.c_str());
+}
+
+void Orchestrator::trace_stash_hidden_batch(int32_t layer, const float * hidden, int32_t n_tokens) {
+    if (!trace_fp_)                                       return;
+    if (layer < 0 || layer >= (int32_t)trace_buf_.size()) return;
+    auto & tb = trace_buf_[layer];
+    tb.n_tokens = n_tokens;
+    tb.hidden_flat.assign(hidden, hidden + (size_t)n_tokens * hidden_dim_);
+    tb.has_hidden = true;
+}
+
+void Orchestrator::trace_stash_indices_batch(int32_t layer, const int32_t * indices, int32_t n_tokens, int32_t top_k) {
+    if (!trace_fp_)                                       return;
+    if (layer < 0 || layer >= (int32_t)trace_buf_.size()) return;
+    auto & tb = trace_buf_[layer];
+    if (tb.n_tokens != n_tokens) {
+        // hidden batch hasn't matched yet; align here.
+        tb.n_tokens = n_tokens;
+    }
+    tb.indices_flat.assign(indices, indices + (size_t)n_tokens * top_k);
+    tb.has_indices = true;
+}
+
+void Orchestrator::trace_emit_weights_batch(int32_t layer, const float * weights, int32_t n_tokens, int32_t top_k) {
+    if (!trace_fp_)                                       return;
+    if (layer < 0 || layer >= (int32_t)trace_buf_.size()) return;
+    auto & tb = trace_buf_[layer];
+    if (!tb.has_hidden || !tb.has_indices)                return;
+    if (tb.n_tokens != n_tokens)                          return;  // shape mismatch — skip
+    if (trace_top_k_ == 0) trace_top_k_ = top_k;
+    if (top_k != trace_top_k_) return;  // top_k drift — skip (defensive)
+
+    constexpr int32_t MAX_K = 32;
+    if (trace_top_k_ > MAX_K) trace_top_k_ = MAX_K;
+
+    std::vector<uint16_t> hidden_fp16(hidden_dim_);
+
+    for (int32_t ti = 0; ti < n_tokens; ti++) {
+        int32_t hdr[2] = { layer, top_k };
+        std::fwrite(hdr, sizeof(int32_t), 2, trace_fp_);
+
+        // hidden_state for this token: fp32 → fp16
+        const float * hsrc = tb.hidden_flat.data() + (size_t)ti * hidden_dim_;
+        for (int32_t i = 0; i < hidden_dim_; i++) {
+            hidden_fp16[i] = fp16_from_fp32(hsrc[i]);
+        }
+        std::fwrite(hidden_fp16.data(), sizeof(uint16_t), (size_t)hidden_dim_, trace_fp_);
+
+        // indices for this token (top_k each)
+        const int32_t * isrc = tb.indices_flat.data() + (size_t)ti * top_k;
+        std::fwrite(isrc, sizeof(int32_t), (size_t)top_k, trace_fp_);
+
+        // weights for this token (top_k each)
+        const float * wsrc = weights + (size_t)ti * top_k;
+        std::fwrite(wsrc, sizeof(float), (size_t)top_k, trace_fp_);
+
+        trace_records_++;
+    }
+
+    tb.has_hidden = false;
+    tb.has_indices = false;
+}
+
+void Orchestrator::_trace_finalize() {
+    if (!trace_fp_) return;
+    // Patch header with final top_k and n_records.
+    std::fseek(trace_fp_, 16, SEEK_SET);
+    uint32_t k32 = (uint32_t)trace_top_k_;
+    std::fwrite(&k32, sizeof(uint32_t), 1, trace_fp_);
+    std::fseek(trace_fp_, 24, SEEK_SET);
+    std::fwrite(&trace_records_, sizeof(uint64_t), 1, trace_fp_);
+    std::fclose(trace_fp_);
+    trace_fp_ = nullptr;
+    std::fprintf(stderr, "[orchestrator] trace dump closed: %llu records\n",
+                 (unsigned long long)trace_records_);
 }
 
 } // namespace moe_orch
@@ -186,25 +333,41 @@ extern "C" bool ggml_eval_callback_orchestrator(
 
     if (is_topk) {
         int32_t layer = std::atoi(name + 13);
+        // Shape: (n_expert_used, n_tokens). t->ne[0]=top_k, t->ne[1]=n_tokens.
+        const int32_t top_k    = (int32_t)t->ne[0];
+        const int32_t n_tokens = t->ne[1] > 0 ? (int32_t)t->ne[1] : 1;
         const int32_t n_elements = (int32_t)ggml_nelements(t);
         if (n_elements <= 0) return false;
         std::vector<int32_t> host(n_elements);
         ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(int32_t));
+        // Cache simulator: full-flat is fine (LRU is idempotent).
         orch->on_routing(layer, host.data(), n_elements);
+        // Trace: stash per-token shape.
+        if (orch->is_trace_enabled()) {
+            orch->trace_stash_indices_batch(layer, host.data(), n_tokens, top_k);
+        }
         return true;
     }
 
     if (is_weights) {
         int32_t layer = std::atoi(name + 16);
+        // Shape: (1, n_expert_used, n_tokens). top_k=ne[1], n_tokens=ne[2].
+        const int32_t top_k    = (int32_t)t->ne[1];
+        const int32_t n_tokens = t->ne[2] > 0 ? (int32_t)t->ne[2] : 1;
         const int32_t n_elements = (int32_t)ggml_nelements(t);
         if (n_elements <= 0) return false;
         std::vector<float> host(n_elements);
         ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(float));
+        // Cache simulator: full-flat update.
         orch->on_routing_weights(layer, host.data(), n_elements);
+        // Trace: emit n_tokens records, completing the (hidden, indices, weights) triple.
+        if (orch->is_trace_enabled()) {
+            orch->trace_emit_weights_batch(layer, host.data(), n_tokens, top_k);
+        }
         return true;
     }
 
-    // is_ffn_norm — fire on_layer_input per token in the batch.
+    // is_ffn_norm — predictor needs the LAST token's hidden state; trace needs all tokens.
     int32_t layer = std::atoi(name + 9);
     // Shape: (n_embd, n_tokens, ...). t->ne[0] is the embedding dim.
     const int64_t n_embd   = t->ne[0];
@@ -215,11 +378,18 @@ extern "C" bool ggml_eval_callback_orchestrator(
     // graph; if it ever isn't, we'd need to dequant — punting for now.
     if (t->type != GGML_TYPE_F32) return false;
 
-    const size_t per_token_bytes = (size_t)n_embd * sizeof(float);
-    std::vector<float> host(n_embd);
+    // Pull the whole batch host-side once.
+    std::vector<float> host_all((size_t)n_embd * (size_t)n_tokens);
+    ggml_backend_tensor_get(t, host_all.data(), 0, host_all.size() * sizeof(float));
+
+    // Predictor: fire on_layer_input per token (matches Python pre-hook semantics).
+    const size_t per_token_floats = (size_t)n_embd;
     for (int64_t i = 0; i < n_tokens; i++) {
-        ggml_backend_tensor_get(t, host.data(), i * per_token_bytes, per_token_bytes);
-        orch->on_layer_input(layer, host.data());
+        orch->on_layer_input(layer, host_all.data() + i * per_token_floats);
+    }
+    // Trace: stash all tokens' hidden states.
+    if (orch->is_trace_enabled()) {
+        orch->trace_stash_hidden_batch(layer, host_all.data(), (int32_t)n_tokens);
     }
     return true;
 }

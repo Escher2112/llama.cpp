@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +41,12 @@ struct OrchestratorConfig {
 
     // Mode.
     bool    shadow_mode            = true;
+
+    // Trace dump (offline predictor training data). Empty path = disabled.
+    // When set, the orchestrator writes a binary trace of every
+    //   (layer, hidden_state, top_k_indices, top_k_weights)
+    // tuple seen during this run. Format documented in trace.h.
+    std::string dump_trace_path;
 };
 
 class Orchestrator {
@@ -112,8 +119,39 @@ private:
     // ffn_moe_topk-N always fires before ffn_moe_weights-N for the same N.
     std::vector<std::vector<int32_t>> last_topk_indices_;
 
+    // Trace dump state. Active when config_.dump_trace_path is non-empty.
+    // Per-layer buffer carries per-token data across the three cb_eval tensor
+    // arrivals (ffn_norm → ffn_moe_topk → ffn_moe_weights), then emits one
+    // record per token when weights complete the triple.
+    struct TraceLayerBuf {
+        int32_t              n_tokens = 0;          // batch size for the pending forward pass
+        std::vector<float>   hidden_flat;           // n_tokens × hidden_dim, row-major per token
+        std::vector<int32_t> indices_flat;          // n_tokens × top_k
+        std::vector<float>   weights_flat;          // n_tokens × top_k
+        bool                 has_hidden = false;
+        bool                 has_indices = false;
+    };
+    std::vector<TraceLayerBuf> trace_buf_;
+    std::FILE *                trace_fp_      = nullptr;
+    int32_t                    trace_top_k_   = 0;   // fixed once first record is emitted
+    uint64_t                   trace_records_ = 0;
+
+public:
+    // Trace path: cb_eval bridge calls these directly when --dump-trace is on.
+    bool is_trace_enabled() const { return trace_fp_ != nullptr; }
+    void trace_stash_hidden_batch (int32_t layer, const float   * hidden,  int32_t n_tokens);
+    void trace_stash_indices_batch(int32_t layer, const int32_t * indices, int32_t n_tokens, int32_t top_k);
+    void trace_emit_weights_batch (int32_t layer, const float   * weights, int32_t n_tokens, int32_t top_k);
+private:
+
     // Refresh L2 cache by querying Hopfield with current conversation embedding.
     void _refresh_l2();
+
+    void _trace_open();
+    void _trace_finalize();
+
+public:
+    ~Orchestrator();
 };
 
 } // namespace moe_orch

@@ -20,6 +20,7 @@
 #include <clocale>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -42,6 +43,8 @@ struct test_args {
     int         l1_capacity                = 32;
     int         l2_capacity                = 80;
     int         prefetch_top_k             = 16;
+    std::string dump_trace_path;          // --dump-trace PATH
+    std::string prompts_file;             // --prompts-file PATH (1 prompt per line)
 };
 
 static void print_usage(const char * prog) {
@@ -58,6 +61,8 @@ static void print_usage(const char * prog) {
         "  --l1 N                           L1 (VRAM) cache capacity per layer (default 32)\n"
         "  --l2 N                           L2 (RAM)  cache capacity per layer (default 80)\n"
         "  --prefetch-top-k N               experts the MLP prefetches per call (default 16)\n"
+        "  --dump-trace PATH                write per-(layer, token) trace to PATH (binary)\n"
+        "  --prompts-file PATH              run a list of prompts (one per line) sequentially\n"
         "  --no-override-exps               do NOT pin experts to CPU (default: do pin)\n",
         prog);
 }
@@ -82,6 +87,10 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "--l2" && need("--l2")) a.l2_capacity = std::atoi(argv[++i]);
         else if (arg == "--prefetch-top-k" && need("--prefetch-top-k"))
                                                 a.prefetch_top_k = std::atoi(argv[++i]);
+        else if (arg == "--dump-trace" && need("--dump-trace"))
+                                                a.dump_trace_path = argv[++i];
+        else if (arg == "--prompts-file" && need("--prompts-file"))
+                                                a.prompts_file = argv[++i];
         else if (arg == "--no-override-exps")    a.override_exps_cpu = false;
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return false; }
         else { std::fprintf(stderr, "unknown arg: %s\n", arg.c_str()); return false; }
@@ -140,7 +149,9 @@ int main(int argc, char ** argv) {
 
     // ---- Phase 2: build orchestrator (if requested) ----
     std::unique_ptr<moe_orch::Orchestrator> orchestrator;
-    const bool orch_enabled = !args.predictor_path.empty() || args.orchestrator_recency_only;
+    const bool orch_enabled = !args.predictor_path.empty()
+                            || args.orchestrator_recency_only
+                            || !args.dump_trace_path.empty();
     const char * mode_label = "BASELINE (no orchestrator)";
     if (orch_enabled) {
         moe_orch::OrchestratorConfig cfg;
@@ -148,16 +159,24 @@ int main(int argc, char ** argv) {
         cfg.l1_capacity = args.l1_capacity;
         cfg.l2_capacity = args.l2_capacity;
         cfg.l1_prefetch_top_k = args.prefetch_top_k;
+        cfg.dump_trace_path = args.dump_trace_path;
         orchestrator = std::make_unique<moe_orch::Orchestrator>(
             cfg, args.predictor_path, /*hopfield=*/"",
             n_layers, n_experts, hidden_dim);
-        mode_label = args.predictor_path.empty()
-            ? "MODE A (recency-only)"
-            : "MODE B (recency + MLP predictor)";
+        if (!args.dump_trace_path.empty() && args.predictor_path.empty() && !args.orchestrator_recency_only) {
+            mode_label = "TRACE-CAPTURE (no cache stats meaningful)";
+        } else {
+            mode_label = args.predictor_path.empty()
+                ? "MODE A (recency-only)"
+                : "MODE B (recency + MLP predictor)";
+        }
         std::printf("Orchestrator: %s  l1=%d  l2=%d\n",
                     mode_label, args.l1_capacity, args.l2_capacity);
         if (!args.predictor_path.empty()) {
             std::printf("  predictor: %s\n", args.predictor_path.c_str());
+        }
+        if (!args.dump_trace_path.empty()) {
+            std::printf("  trace dump: %s\n", args.dump_trace_path.c_str());
         }
     } else {
         std::printf("Orchestrator: %s\n", mode_label);
@@ -182,42 +201,71 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    std::vector<llama_token> tokens(args.prompt.size() + 16);
-    int n_tok = llama_tokenize(vocab, args.prompt.c_str(), (int)args.prompt.size(),
-                                tokens.data(), (int)tokens.size(),
-                                add_bos, /*parse_special=*/true);
-    if (n_tok < 0) { std::fprintf(stderr, "tokenize failed\n"); return 1; }
-    tokens.resize(n_tok);
-    std::printf("Tokenized %d input tokens.\n", n_tok);
+    auto run_one_prompt = [&](const std::string & prompt) -> bool {
+        std::vector<llama_token> tokens(prompt.size() + 16);
+        int n_tok = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
+                                    tokens.data(), (int)tokens.size(),
+                                    add_bos, /*parse_special=*/true);
+        if (n_tok < 0) { std::fprintf(stderr, "tokenize failed\n"); return false; }
+        tokens.resize(n_tok);
 
-    // Prefill
-    std::printf(">>> ");
-    std::fflush(stdout);
-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tok))) {
-        std::fprintf(stderr, "prefill failed\n"); return 1;
+        std::printf(">>> [%d toks in] ", n_tok);
+        std::fflush(stdout);
+        if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tok))) {
+            std::fprintf(stderr, "prefill failed\n"); return false;
+        }
+
+        for (int i = 0; i < args.n_predict; i++) {
+            const float * logits = llama_get_logits_ith(ctx, -1);
+            int n_vocab = llama_vocab_n_tokens(vocab);
+            llama_token best = 0;
+            float       best_l = logits[0];
+            for (int t = 1; t < n_vocab; t++) {
+                if (logits[t] > best_l) { best_l = logits[t]; best = t; }
+            }
+            if (llama_vocab_is_eog(vocab, best)) break;
+
+            char piece[128];
+            int n = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, true);
+            if (n > 0) { std::fwrite(piece, 1, n, stdout); std::fflush(stdout); }
+
+            if (llama_decode(ctx, llama_batch_get_one(&best, 1))) {
+                std::fprintf(stderr, "decode step %d failed\n", i); return false;
+            }
+        }
+        std::printf("\n<<<\n");
+        return true;
+    };
+
+    // Build prompt list. If --prompts-file is set, read one prompt per non-empty
+    // line; otherwise the single -p prompt.
+    std::vector<std::string> prompts;
+    if (!args.prompts_file.empty()) {
+        std::ifstream f(args.prompts_file);
+        if (!f) {
+            std::fprintf(stderr, "failed to open prompts file: %s\n", args.prompts_file.c_str());
+            llama_free(ctx); llama_model_free(model); return 1;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) prompts.push_back(line);
+        }
+        std::printf("Loaded %d prompts from %s\n", (int)prompts.size(), args.prompts_file.c_str());
+    } else {
+        prompts.push_back(args.prompt);
     }
 
-    // Greedy decode N tokens
-    for (int i = 0; i < args.n_predict; i++) {
-        // Greedy: take argmax of logits.
-        const float * logits = llama_get_logits_ith(ctx, -1);
-        int n_vocab = llama_vocab_n_tokens(vocab);
-        llama_token best = 0;
-        float       best_l = logits[0];
-        for (int t = 1; t < n_vocab; t++) {
-            if (logits[t] > best_l) { best_l = logits[t]; best = t; }
+    for (size_t pi = 0; pi < prompts.size(); pi++) {
+        if (prompts.size() > 1) {
+            std::printf("\n--- prompt %d/%d ---\n", (int)(pi + 1), (int)prompts.size());
+            // Clear KV cache so prompts are independent (important for trace
+            // capture so the predictor doesn't pick up cross-prompt artifacts).
+            llama_memory_clear(llama_get_memory(ctx), true);
         }
-        if (llama_vocab_is_eog(vocab, best)) break;
-
-        char piece[128];
-        int n = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, true);
-        if (n > 0) { std::fwrite(piece, 1, n, stdout); std::fflush(stdout); }
-
-        if (llama_decode(ctx, llama_batch_get_one(&best, 1))) {
-            std::fprintf(stderr, "decode step %d failed\n", i); break;
-        }
+        if (!run_one_prompt(prompts[pi])) break;
     }
-    std::printf("\n<<<\n\n");
+    std::printf("\n");
 
     llama_perf_context_print(ctx);
 
