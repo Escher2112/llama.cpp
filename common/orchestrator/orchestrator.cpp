@@ -2,6 +2,7 @@
 
 #include "orchestrator.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +30,15 @@ Orchestrator::Orchestrator(const OrchestratorConfig &  config,
              config.l2_capacity,
              config.shadow_mode)
 {
-    if (!l1_predictor_.load(predictor_mlp_bin_path.c_str())) {
+    // Empty path = recency-only mode (Mode A): orchestrator observes routing
+    // and runs the cache, but skips MLP prefetch entirely.
+    if (predictor_mlp_bin_path.empty()) {
+        l1_predictor_loaded_ = false;
+        std::fprintf(stderr, "[orchestrator] recency-only mode (no MLP predictor)\n");
+    } else if (l1_predictor_.load(predictor_mlp_bin_path.c_str())) {
+        l1_predictor_loaded_ = true;
+    } else {
+        l1_predictor_loaded_ = false;
         std::fprintf(stderr, "[orchestrator] failed to load MLP predictor from %s\n",
                      predictor_mlp_bin_path.c_str());
     }
@@ -40,6 +49,7 @@ Orchestrator::Orchestrator(const OrchestratorConfig &  config,
 
     embedding_window_.reserve(config.embedding_window_tokens);
     scratch_top_.resize(config.l1_prefetch_top_k);
+    last_topk_indices_.resize((size_t)n_layers);
 }
 
 double Orchestrator::l1_predictor_avg_ms() const {
@@ -71,6 +81,7 @@ void Orchestrator::on_layer_input(int32_t layer, const float * hidden_state) {
     }
 
     // ---- L1 prefetch: predict experts for layers (layer + horizon_i) ----
+    if (!l1_predictor_loaded_) return;
     for (int32_t h = 0; h < config_.num_prefetch_horizons; h++) {
         int32_t M = config_.prefetch_horizons[h];
         if (M <= 0) continue;
@@ -97,8 +108,23 @@ void Orchestrator::on_layer_input(int32_t layer, const float * hidden_state) {
 }
 
 void Orchestrator::on_routing(int32_t layer, const int32_t * indices, int32_t count) {
+    if (layer < 0 || layer >= n_layers_) return;
+    auto & buf = last_topk_indices_[layer];
+    buf.assign(indices, indices + count);
     for (int32_t i = 0; i < count; i++) {
         cache_.access(layer, indices[i]);
+    }
+}
+
+void Orchestrator::on_routing_weights(int32_t layer, const float * weights, int32_t count) {
+    if (layer < 0 || layer >= n_layers_) return;
+    const auto & buf = last_topk_indices_[layer];
+    // Pair weights[i] with buf[i]. Sizes should match — if not, we silently
+    // pair what we can; mismatches indicate either an arch we haven't seen
+    // or a tokens>1 prefill where weights cover multiple tokens.
+    const int32_t pair_count = (int32_t)std::min((size_t)count, buf.size());
+    for (int32_t i = 0; i < pair_count; i++) {
+        cache_.update_router_weight(layer, buf[i], weights[i]);
     }
 }
 
@@ -135,35 +161,42 @@ extern "C" bool ggml_eval_callback_orchestrator(
     bool                 ask,
     void *               user_data) {
 
-    // The tensor name is set by `cb(selected_experts, "ffn_moe_topk", il)` →
-    // ggml_format_name → "ffn_moe_topk-N".
     const char * name = ggml_get_name(t);
-    if (!name || std::strncmp(name, "ffn_moe_topk-", 13) != 0) {
-        return false;  // not a tensor we care about
-    }
+    if (!name) return false;
 
-    if (ask) {
-        return true;   // yes, please call us again with ask=false post-compute
-    }
+    // Two prefixes we care about:
+    //   ffn_moe_topk-N        → int32 indices (n_expert_used, n_tokens)
+    //   ffn_moe_weights-N     → fp32 raw router weights, same shape (well, with
+    //                           a leading 1: (1, n_expert_used, n_tokens))
+    // We deliberately do NOT match ffn_moe_weights_softmax / _norm / _scaled —
+    // their relative ordering is preserved through monotonic transforms, and
+    // matching only "ffn_moe_weights-" (with the trailing dash) is exact.
+    const bool is_topk    = std::strncmp(name, "ffn_moe_topk-",    13) == 0;
+    const bool is_weights = std::strncmp(name, "ffn_moe_weights-", 16) == 0;
+    if (!is_topk && !is_weights) return false;
 
-    // Post-compute path. Read the int32 expert indices.
+    if (ask) return true;
+
     auto * orch = static_cast<moe_orch::Orchestrator *>(user_data);
     if (!orch) return false;
 
-    // Parse layer index from suffix.
-    int32_t layer = std::atoi(name + 13);
+    if (is_topk) {
+        int32_t layer = std::atoi(name + 13);
+        const int32_t n_elements = (int32_t)ggml_nelements(t);
+        if (n_elements <= 0) return false;
+        std::vector<int32_t> host(n_elements);
+        ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(int32_t));
+        orch->on_routing(layer, host.data(), n_elements);
+        return true;
+    }
 
-    // Tensor shape: (n_expert_used, n_tokens) per the ggml_argsort_top_k call.
-    // Element type is I32. Total elements = n_expert_used * n_tokens.
+    // is_weights
+    int32_t layer = std::atoi(name + 16);
     const int32_t n_elements = (int32_t)ggml_nelements(t);
     if (n_elements <= 0) return false;
-
-    // Tensor data may be on a backend buffer (GPU). Use ggml_backend_tensor_get
-    // to copy to a host buffer.
-    std::vector<int32_t> host(n_elements);
-    ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(int32_t));
-
-    orch->on_routing(layer, host.data(), n_elements);
+    std::vector<float> host(n_elements);
+    ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(float));
+    orch->on_routing_weights(layer, host.data(), n_elements);
     return true;
 }
 

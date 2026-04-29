@@ -65,6 +65,11 @@ public:
     //   is responsible for reading back from any GPU-resident tensor.
     void on_routing(int32_t layer, const int32_t * indices, int32_t count);
 
+    // Router weights: float buffer of length top_k * seq_len, paired 1:1 with
+    //   the indices passed to the most recent on_routing call for this layer.
+    //   Used for weight-aware eviction.
+    void on_routing_weights(int32_t layer, const float * weights, int32_t count);
+
     // Diagnostics
     CacheStats cache_stats() const { return cache_.stats(); }
     uint64_t   l1_predictor_calls() const { return l1_predictor_calls_; }
@@ -82,6 +87,7 @@ private:
     int32_t            hidden_dim_;
 
     MLPPredictor       l1_predictor_;
+    bool               l1_predictor_loaded_   = false;
     // TODO: HopfieldPredictor l2_predictor_;  — v0 stub (pass-through), wire after shadow test
     bool               l2_predictor_available_ = false;
 
@@ -100,6 +106,11 @@ private:
 
     // Reusable scratch — avoids per-call allocations.
     std::vector<int32_t> scratch_top_;     // size l1_prefetch_top_k
+
+    // Per-layer buffer of the most recent topk indices we've seen. Populated
+    // by on_routing, consumed by on_routing_weights to pair weights→experts.
+    // ffn_moe_topk-N always fires before ffn_moe_weights-N for the same N.
+    std::vector<std::vector<int32_t>> last_topk_indices_;
 
     // Refresh L2 cache by querying Hopfield with current conversation embedding.
     void _refresh_l2();

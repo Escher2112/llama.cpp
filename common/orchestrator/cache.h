@@ -72,6 +72,11 @@ public:
     // the expert was found in (NOT promoted to).
     ExpertLocation access(int32_t layer, int32_t expert);
 
+    // Router-weight update — called when we observe the router's softmax
+    // weight for an expert at a given layer. Signal is used by the eviction
+    // policy: low-weight experts evict first.
+    void update_router_weight(int32_t layer, int32_t expert, float weight);
+
     // Prefetch path — called by the L1 (MLP) predictor with the experts it
     // wants resident in VRAM by the next access at this layer.
     // `confidences` is optional; values default to 1.0 if not provided.
@@ -126,6 +131,9 @@ private:
     // Access counts for LFU + predictor confidence weighting on L1 evictions.
     std::vector<uint64_t> access_count_;             // [layer * n_experts + expert]
     std::vector<float>    predictor_confidence_;     // [layer * n_experts + expert]
+    // Most recent router softmax weight observed for this expert. Drives
+    // weight-aware eviction: low-weight experts are preferred victims.
+    std::vector<float>    router_weight_;            // [layer * n_experts + expert]
 
     // Event log (capped to avoid OOM in long runs).
     std::vector<CacheEvent> events_;

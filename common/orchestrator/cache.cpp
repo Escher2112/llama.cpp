@@ -55,9 +55,20 @@ ThreeTierCache::ThreeTierCache(int32_t n_layers,
       l1_lru_((size_t)n_layers),
       l2_lru_((size_t)n_layers),
       access_count_((size_t)n_layers * n_experts_per_layer, 0),
-      predictor_confidence_((size_t)n_layers * n_experts_per_layer, 0.0f)
+      predictor_confidence_((size_t)n_layers * n_experts_per_layer, 0.0f),
+      router_weight_((size_t)n_layers * n_experts_per_layer, 0.0f)
 {
     events_.reserve(1 << 16);
+}
+
+// ---------- router weight update ----------
+
+void ThreeTierCache::update_router_weight(int32_t layer, int32_t expert, float weight) {
+    // EMA with alpha=0.3 — stable enough across consecutive accesses, responsive
+    // enough to track expert-importance shifts as the conversation moves.
+    const size_t idx = _idx(layer, expert);
+    constexpr float alpha = 0.3f;
+    router_weight_[idx] = (1.0f - alpha) * router_weight_[idx] + alpha * weight;
 }
 
 // ---------- queries ----------
@@ -190,14 +201,22 @@ void ThreeTierCache::_make_room_in_l2(int32_t layer) {
 }
 
 int32_t ThreeTierCache::_pick_l1_victim(int32_t layer) {
-    // Predictor-confidence-weighted LFU.
-    // score = freq + 100 * conf  (matches Python tuned policy)
-    // Lower score = better victim.
+    // Router-weight-aware LFU.
+    //
+    // The model's own softmax router tells us how much it valued each
+    // expert at the most recent step — that's strictly better signal for
+    // eviction than a synthetic predictor confidence we'd have to estimate.
+    //
+    // score = freq + 100 * router_weight + 10 * predictor_confidence
+    // Lower score = better victim. router_weight dominates predictor_conf
+    // because router_weight is observed truth; predictor_conf is a guess.
     int32_t best_victim   = -1;
     double  best_score    = 1e308;
     for (auto e : l1_lru_[layer].order) {
         const size_t idx = _idx(layer, e);
-        const double score = (double)access_count_[idx] + 100.0 * predictor_confidence_[idx];
+        const double score = (double)access_count_[idx]
+                           + 100.0 * (double)router_weight_[idx]
+                           +  10.0 * (double)predictor_confidence_[idx];
         if (score < best_score) {
             best_score = score;
             best_victim = e;

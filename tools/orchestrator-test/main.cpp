@@ -11,8 +11,10 @@
 
 #include "llama.h"
 
-#include "orchestrator/orchestrator.h"
-#include "orchestrator/predictor.h"
+#include "ggml-backend.h"
+
+#include "orchestrator.h"
+#include "predictor.h"
 
 #include <clocale>
 #include <cstdio>
@@ -30,6 +32,11 @@ struct test_args {
     int         n_threads         = 24;
     int         ctx_size          = 4096;
     bool        override_exps_cpu = true;
+    // Modes:
+    //   --orchestrator-predictor PATH    => Mode B (predictor + recency)
+    //   --orchestrator-recency-only      => Mode A (recency-only, no MLP)
+    //   neither                          => no orchestrator (baseline)
+    bool        orchestrator_recency_only = false;
 };
 
 static void print_usage(const char * prog) {
@@ -41,7 +48,8 @@ static void print_usage(const char * prog) {
         "  -ngl N                           layers on GPU (default 99 = all)\n"
         "  -t N                             CPU threads (default 24)\n"
         "  -c N                             context size (default 4096)\n"
-        "  --orchestrator-predictor PATH    .bin predictor file (enables orchestrator)\n"
+        "  --orchestrator-predictor PATH    .bin predictor file (Mode B: MLP + recency)\n"
+        "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
         "  --no-override-exps               do NOT pin experts to CPU (default: do pin)\n",
         prog);
 }
@@ -61,6 +69,7 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "-c"   && need("-c"))   a.ctx_size       = std::atoi(argv[++i]);
         else if (arg == "--orchestrator-predictor" && need("--orchestrator-predictor"))
                                                 a.predictor_path = argv[++i];
+        else if (arg == "--orchestrator-recency-only") a.orchestrator_recency_only = true;
         else if (arg == "--no-override-exps")    a.override_exps_cpu = false;
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return false; }
         else { std::fprintf(stderr, "unknown arg: %s\n", arg.c_str()); return false; }
@@ -95,14 +104,16 @@ int main(int argc, char ** argv) {
     // Apply the same expert-on-CPU override the baseline benchmark uses.
     // This is via the tensor-buft override mechanism. The CLI-equivalent of
     // --override-tensor "exps.=CPU" maps to this struct.
+    // Pin all expert tensors to CPU buffer type — same effect as
+    // `--override-tensor "\.ffn_(up|down|gate|gate_up)_(ch|)exps=CPU"` on
+    // llama-cli. Required for big MoE models that don't fit in VRAM whole.
     std::vector<llama_model_tensor_buft_override> overrides;
+    static const char * EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
     if (args.override_exps_cpu) {
-        // The user-side string is "exps.=CPU"; the tensor-buft override API
-        // takes a regex pattern + buffer-type pointer. We match by pattern.
-        // (See llama-cli's --override-tensor handling.)
-        // For v0 simplicity we skip this here — caller can use the same flag
-        // pattern via the prebuilt llama-cli for the baseline; this tool's
-        // smoke test just confirms the orchestrator wiring works.
+        overrides.push_back({EXPS_REGEX, ggml_backend_cpu_buffer_type()});
+        overrides.push_back({nullptr, nullptr});  // sentinel
+        mparams.tensor_buft_overrides = overrides.data();
+        std::printf("Override: experts pinned to CPU buffer type.\n");
     }
 
     std::printf("Loading model: %s\n", args.model_path.c_str());
@@ -117,15 +128,23 @@ int main(int argc, char ** argv) {
 
     // ---- Phase 2: build orchestrator (if requested) ----
     std::unique_ptr<moe_orch::Orchestrator> orchestrator;
-    if (!args.predictor_path.empty()) {
+    const bool orch_enabled = !args.predictor_path.empty() || args.orchestrator_recency_only;
+    const char * mode_label = "BASELINE (no orchestrator)";
+    if (orch_enabled) {
         moe_orch::OrchestratorConfig cfg;
         cfg.shadow_mode = true;
         orchestrator = std::make_unique<moe_orch::Orchestrator>(
             cfg, args.predictor_path, /*hopfield=*/"",
             n_layers, n_experts, hidden_dim);
-        std::printf("Orchestrator: built (predictor=%s)\n", args.predictor_path.c_str());
+        mode_label = args.predictor_path.empty()
+            ? "MODE A (recency-only)"
+            : "MODE B (recency + MLP predictor)";
+        std::printf("Orchestrator: %s\n", mode_label);
+        if (!args.predictor_path.empty()) {
+            std::printf("  predictor: %s\n", args.predictor_path.c_str());
+        }
     } else {
-        std::printf("Orchestrator: not enabled (pass --orchestrator-predictor PATH)\n");
+        std::printf("Orchestrator: %s\n", mode_label);
     }
 
     // ---- Phase 3: build context with cb_eval wired ----
@@ -188,15 +207,19 @@ int main(int argc, char ** argv) {
 
     if (orchestrator) {
         auto s = orchestrator->cache_stats();
-        std::printf("\n=== Orchestrator cache stats ===\n");
+        std::printf("\n=== Orchestrator cache stats - %s ===\n", mode_label);
         std::printf("L1 hits:           %llu\n", (unsigned long long)s.hits_L1);
         std::printf("L2 hits:           %llu\n", (unsigned long long)s.hits_L2);
         std::printf("L3 misses:         %llu\n", (unsigned long long)s.misses_L3);
         std::printf("L1 hit rate:       %.3f\n", s.l1_hit_rate);
+        const uint64_t total = s.hits_L1 + s.hits_L2 + s.misses_L3;
+        const double l12_rate = total ? (double)(s.hits_L1 + s.hits_L2) / (double)total : 0.0;
+        std::printf("L1+L2 hit rate:    %.3f\n", l12_rate);
         std::printf("Promotions to L1:  %llu\n", (unsigned long long)s.promotions_to_L1);
         std::printf("Evictions L1->L2:  %llu\n", (unsigned long long)s.evictions_L1_to_L2);
         std::printf("Evictions L2->L3:  %llu\n", (unsigned long long)s.evictions_L2_to_L3);
         std::printf("L1 predictor calls: %llu\n", (unsigned long long)orchestrator->l1_predictor_calls());
+        std::printf("L1 predictor avg:   %.3f ms\n", orchestrator->l1_predictor_avg_ms());
     }
 
     llama_free(ctx);
