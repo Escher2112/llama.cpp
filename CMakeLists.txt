@@ -116,6 +116,9 @@ option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# moe-engine: predictive expert prefetch orchestrator
+option(LLAMA_ORCHESTRATOR "llama: build with predictive expert prefetch orchestrator (moe-engine)" OFF)
+
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -199,6 +202,10 @@ add_subdirectory(src)
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
     add_subdirectory(vendor/cpp-httplib)
+endif()
+
+if (LLAMA_ORCHESTRATOR)
+    add_subdirectory(common/orchestrator)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
