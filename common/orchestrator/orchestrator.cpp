@@ -173,7 +173,11 @@ extern "C" bool ggml_eval_callback_orchestrator(
     // matching only "ffn_moe_weights-" (with the trailing dash) is exact.
     const bool is_topk    = std::strncmp(name, "ffn_moe_topk-",    13) == 0;
     const bool is_weights = std::strncmp(name, "ffn_moe_weights-", 16) == 0;
-    if (!is_topk && !is_weights) return false;
+    // ffn_norm-N is the post-attention-norm output that feeds the router. This
+    // matches the Python `Qwen3MoeSparseMoeBlock` pre-hook semantics — same
+    // hidden state the predictor was trained against.
+    const bool is_ffn_norm = std::strncmp(name, "ffn_norm-", 9) == 0;
+    if (!is_topk && !is_weights && !is_ffn_norm) return false;
 
     if (ask) return true;
 
@@ -190,13 +194,33 @@ extern "C" bool ggml_eval_callback_orchestrator(
         return true;
     }
 
-    // is_weights
-    int32_t layer = std::atoi(name + 16);
-    const int32_t n_elements = (int32_t)ggml_nelements(t);
-    if (n_elements <= 0) return false;
-    std::vector<float> host(n_elements);
-    ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(float));
-    orch->on_routing_weights(layer, host.data(), n_elements);
+    if (is_weights) {
+        int32_t layer = std::atoi(name + 16);
+        const int32_t n_elements = (int32_t)ggml_nelements(t);
+        if (n_elements <= 0) return false;
+        std::vector<float> host(n_elements);
+        ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(float));
+        orch->on_routing_weights(layer, host.data(), n_elements);
+        return true;
+    }
+
+    // is_ffn_norm — fire on_layer_input per token in the batch.
+    int32_t layer = std::atoi(name + 9);
+    // Shape: (n_embd, n_tokens, ...). t->ne[0] is the embedding dim.
+    const int64_t n_embd   = t->ne[0];
+    const int64_t n_tokens = t->ne[1] > 0 ? t->ne[1] : 1;
+    if (n_embd <= 0) return false;
+
+    // Predictor expects fp32. ffn_norm output should already be fp32 in this
+    // graph; if it ever isn't, we'd need to dequant — punting for now.
+    if (t->type != GGML_TYPE_F32) return false;
+
+    const size_t per_token_bytes = (size_t)n_embd * sizeof(float);
+    std::vector<float> host(n_embd);
+    for (int64_t i = 0; i < n_tokens; i++) {
+        ggml_backend_tensor_get(t, host.data(), i * per_token_bytes, per_token_bytes);
+        orch->on_layer_input(layer, host.data());
+    }
     return true;
 }
 
