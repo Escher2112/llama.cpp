@@ -237,11 +237,24 @@ void ThreeTierCache::_log(CacheEvent::Kind kind, int32_t layer, int32_t expert) 
 CacheStats ThreeTierCache::stats() const {
     CacheStats s;
     s.events_total = events_.size();
+    s.per_layer_hits_L1.assign((size_t)n_layers_, 0);
+    s.per_layer_hits_L2.assign((size_t)n_layers_, 0);
+    s.per_layer_misses_L3.assign((size_t)n_layers_, 0);
     for (const auto & e : events_) {
+        const bool layer_in_range = e.layer >= 0 && e.layer < n_layers_;
         switch (e.kind) {
-            case CacheEvent::HIT_L1:           s.hits_L1++; break;
-            case CacheEvent::HIT_L2:           s.hits_L2++; break;
-            case CacheEvent::MISS_L3:          s.misses_L3++; break;
+            case CacheEvent::HIT_L1:
+                s.hits_L1++;
+                if (layer_in_range) s.per_layer_hits_L1[e.layer]++;
+                break;
+            case CacheEvent::HIT_L2:
+                s.hits_L2++;
+                if (layer_in_range) s.per_layer_hits_L2[e.layer]++;
+                break;
+            case CacheEvent::MISS_L3:
+                s.misses_L3++;
+                if (layer_in_range) s.per_layer_misses_L3[e.layer]++;
+                break;
             case CacheEvent::PROMOTE_L2_TO_L1: s.promotions_to_L1++; break;
             case CacheEvent::PROMOTE_L3_TO_L1: s.promotions_to_L1++; break;
             case CacheEvent::EVICT_L1_TO_L2:   s.evictions_L1_to_L2++; break;

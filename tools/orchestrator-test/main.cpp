@@ -16,11 +16,13 @@
 #include "orchestrator.h"
 #include "predictor.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 struct test_args {
@@ -37,6 +39,9 @@ struct test_args {
     //   --orchestrator-recency-only      => Mode A (recency-only, no MLP)
     //   neither                          => no orchestrator (baseline)
     bool        orchestrator_recency_only = false;
+    int         l1_capacity                = 32;
+    int         l2_capacity                = 80;
+    int         prefetch_top_k             = 16;
 };
 
 static void print_usage(const char * prog) {
@@ -50,6 +55,9 @@ static void print_usage(const char * prog) {
         "  -c N                             context size (default 4096)\n"
         "  --orchestrator-predictor PATH    .bin predictor file (Mode B: MLP + recency)\n"
         "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
+        "  --l1 N                           L1 (VRAM) cache capacity per layer (default 32)\n"
+        "  --l2 N                           L2 (RAM)  cache capacity per layer (default 80)\n"
+        "  --prefetch-top-k N               experts the MLP prefetches per call (default 16)\n"
         "  --no-override-exps               do NOT pin experts to CPU (default: do pin)\n",
         prog);
 }
@@ -70,6 +78,10 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "--orchestrator-predictor" && need("--orchestrator-predictor"))
                                                 a.predictor_path = argv[++i];
         else if (arg == "--orchestrator-recency-only") a.orchestrator_recency_only = true;
+        else if (arg == "--l1" && need("--l1")) a.l1_capacity = std::atoi(argv[++i]);
+        else if (arg == "--l2" && need("--l2")) a.l2_capacity = std::atoi(argv[++i]);
+        else if (arg == "--prefetch-top-k" && need("--prefetch-top-k"))
+                                                a.prefetch_top_k = std::atoi(argv[++i]);
         else if (arg == "--no-override-exps")    a.override_exps_cpu = false;
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return false; }
         else { std::fprintf(stderr, "unknown arg: %s\n", arg.c_str()); return false; }
@@ -133,13 +145,17 @@ int main(int argc, char ** argv) {
     if (orch_enabled) {
         moe_orch::OrchestratorConfig cfg;
         cfg.shadow_mode = true;
+        cfg.l1_capacity = args.l1_capacity;
+        cfg.l2_capacity = args.l2_capacity;
+        cfg.l1_prefetch_top_k = args.prefetch_top_k;
         orchestrator = std::make_unique<moe_orch::Orchestrator>(
             cfg, args.predictor_path, /*hopfield=*/"",
             n_layers, n_experts, hidden_dim);
         mode_label = args.predictor_path.empty()
             ? "MODE A (recency-only)"
             : "MODE B (recency + MLP predictor)";
-        std::printf("Orchestrator: %s\n", mode_label);
+        std::printf("Orchestrator: %s  l1=%d  l2=%d\n",
+                    mode_label, args.l1_capacity, args.l2_capacity);
         if (!args.predictor_path.empty()) {
             std::printf("  predictor: %s\n", args.predictor_path.c_str());
         }
@@ -220,6 +236,45 @@ int main(int argc, char ** argv) {
         std::printf("Evictions L2->L3:  %llu\n", (unsigned long long)s.evictions_L2_to_L3);
         std::printf("L1 predictor calls: %llu\n", (unsigned long long)orchestrator->l1_predictor_calls());
         std::printf("L1 predictor avg:   %.3f ms\n", orchestrator->l1_predictor_avg_ms());
+
+        // Per-layer breakdown — find the bottleneck layers (lowest L1+L2 rates).
+        std::printf("\n--- Per-layer L1 / L1+L2 hit rate (lowest 8 + highest 8) ---\n");
+        std::vector<std::tuple<double, double, int, uint64_t>> rows;  // (l1_rate, l12_rate, layer, total)
+        rows.reserve(s.per_layer_hits_L1.size());
+        for (size_t L = 0; L < s.per_layer_hits_L1.size(); L++) {
+            const uint64_t h1 = s.per_layer_hits_L1[L];
+            const uint64_t h2 = s.per_layer_hits_L2[L];
+            const uint64_t m3 = s.per_layer_misses_L3[L];
+            const uint64_t tot = h1 + h2 + m3;
+            if (tot == 0) continue;
+            const double l1r  = (double)h1 / (double)tot;
+            const double l12r = (double)(h1 + h2) / (double)tot;
+            rows.emplace_back(l1r, l12r, (int)L, tot);
+        }
+        // Sort ascending by L1+L2 rate to surface bottleneck layers.
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto & a, const auto & b) { return std::get<1>(a) < std::get<1>(b); });
+        const size_t n_show = std::min<size_t>(8, rows.size());
+        std::printf("Layer  L1     L1+L2  accesses   (lowest L1+L2)\n");
+        for (size_t i = 0; i < n_show; i++) {
+            std::printf("L%-3d   %.3f  %.3f  %llu\n",
+                        std::get<2>(rows[i]),
+                        std::get<0>(rows[i]),
+                        std::get<1>(rows[i]),
+                        (unsigned long long)std::get<3>(rows[i]));
+        }
+        if (rows.size() > n_show) {
+            std::printf("...\n");
+            const size_t tail_start = rows.size() > n_show ? rows.size() - n_show : 0;
+            std::printf("Layer  L1     L1+L2  accesses   (highest L1+L2)\n");
+            for (size_t i = tail_start; i < rows.size(); i++) {
+                std::printf("L%-3d   %.3f  %.3f  %llu\n",
+                            std::get<2>(rows[i]),
+                            std::get<0>(rows[i]),
+                            std::get<1>(rows[i]),
+                            (unsigned long long)std::get<3>(rows[i]));
+            }
+        }
     }
 
     llama_free(ctx);

@@ -51,6 +51,11 @@ struct CacheStats {
     uint64_t evictions_L1_to_L2      = 0;
     uint64_t evictions_L2_to_L3      = 0;
     double   l1_hit_rate             = 0.0;
+
+    // Per-layer breakdown. Indexed by layer; size = n_layers.
+    std::vector<uint64_t> per_layer_hits_L1;
+    std::vector<uint64_t> per_layer_hits_L2;
+    std::vector<uint64_t> per_layer_misses_L3;
 };
 
 class ThreeTierCache {
