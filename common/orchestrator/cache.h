@@ -140,7 +140,24 @@ private:
     // weight-aware eviction: low-weight experts are preferred victims.
     std::vector<float>    router_weight_;            // [layer * n_experts + expert]
 
-    // Event log (capped to avoid OOM in long runs).
+    // Running scalar counters. Updated in _log alongside the event vector.
+    // stats() returns these directly so callers can clear_events() between
+    // prompts in long runs without losing the cumulative summary numbers.
+    // (Pre-fix, stats() walked events_, so clearing events between prompts
+    // lost the multi-prompt aggregate. The events_ vector hitting its 4M cap
+    // at L1=8/L2=32 Mode B was the suspected cause of the prompt-14 abort.)
+    uint64_t              total_hits_L1_           = 0;
+    uint64_t              total_hits_L2_           = 0;
+    uint64_t              total_misses_L3_         = 0;
+    uint64_t              total_promotions_to_L1_  = 0;
+    uint64_t              total_evictions_L1_to_L2_= 0;
+    uint64_t              total_evictions_L2_to_L3_= 0;
+    std::vector<uint64_t> per_layer_hits_L1_;        // size n_layers
+    std::vector<uint64_t> per_layer_hits_L2_;
+    std::vector<uint64_t> per_layer_misses_L3_;
+
+    // Event log (audit-only — bounded to ~4M to prevent unbounded growth at
+    // high churn). Stats no longer depend on this; safe to clear at any time.
     std::vector<CacheEvent> events_;
     static constexpr size_t MAX_EVENTS = 1u << 22;   // ~4M events; ~64 MB at 16 B/event
 

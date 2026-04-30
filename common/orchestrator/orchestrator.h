@@ -87,6 +87,15 @@ public:
     // Test-only access
     const ThreeTierCache & cache() const { return cache_; }
 
+    // Drop the cache event log — call between prompts in a multi-prompt run.
+    // The events_ vector accumulates across the entire run otherwise; at high
+    // churn (Mode B + tight cache) it hits its 4M cap and the surrounding heap
+    // pressure has historically tripped a bad_alloc downstream. Stats are
+    // computed from the events vector, so summary numbers are PER-PROMPT after
+    // a clear, not cumulative — caller is responsible for accumulating across
+    // prompts if a cumulative view is needed.
+    void clear_cache_events() { cache_.clear_events(); }
+
 private:
     OrchestratorConfig config_;
     int32_t            n_layers_;

@@ -262,6 +262,14 @@ int main(int argc, char ** argv) {
             // Clear KV cache so prompts are independent (important for trace
             // capture so the predictor doesn't pick up cross-prompt artifacts).
             llama_memory_clear(llama_get_memory(ctx), true);
+            // Drop the orchestrator's audit event log between prompts. Stats
+            // live in scalar counters now (see ThreeTierCache::_log) so they
+            // accumulate correctly across the run; this just prevents events_
+            // from growing toward its 4M cap. At L1=8/L2=32 Mode B that cap
+            // was reachable mid-run and the surrounding heap pressure tripped
+            // the prompt-14 abort. Cumulative summary still reports correctly
+            // at the end of the run.
+            if (orchestrator) orchestrator->clear_cache_events();
         }
         if (!run_one_prompt(prompts[pi])) break;
     }

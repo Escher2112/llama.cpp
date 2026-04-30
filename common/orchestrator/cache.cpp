@@ -56,7 +56,10 @@ ThreeTierCache::ThreeTierCache(int32_t n_layers,
       l2_lru_((size_t)n_layers),
       access_count_((size_t)n_layers * n_experts_per_layer, 0),
       predictor_confidence_((size_t)n_layers * n_experts_per_layer, 0.0f),
-      router_weight_((size_t)n_layers * n_experts_per_layer, 0.0f)
+      router_weight_((size_t)n_layers * n_experts_per_layer, 0.0f),
+      per_layer_hits_L1_((size_t)n_layers, 0),
+      per_layer_hits_L2_((size_t)n_layers, 0),
+      per_layer_misses_L3_((size_t)n_layers, 0)
 {
     events_.reserve(1 << 16);
 }
@@ -127,6 +130,19 @@ void ThreeTierCache::prefetch_to_l1(int32_t layer,
                                     const int32_t * experts,
                                     int32_t count,
                                     const float * confidences) {
+    // Skip-if-resident policy:
+    //   already in L1 → bump LRU, done.
+    //   already in L2 → bump L2 LRU only. The predictor's interest keeps the
+    //                   expert from aging to L3, but we don't promote to L1
+    //                   speculatively. If the model actually accesses it,
+    //                   access() handles the L2→L1 promotion. This eliminates
+    //                   the redundant "promote to L1, evict, promote again"
+    //                   churn that dominated Mode B in the warm regime
+    //                   (per STATUS_apr30_morning: 99.7% of Mode B promotions
+    //                   were re-evicted before being hit).
+    //   in L3        → promote L3→L1 (with eviction). This is the predictor's
+    //                   actual job: pulling cold experts into VRAM ahead of
+    //                   the access.
     for (int32_t i = 0; i < count; i++) {
         const int32_t e = experts[i];
         const float   c = confidences ? confidences[i] : 1.0f;
@@ -135,7 +151,7 @@ void ThreeTierCache::prefetch_to_l1(int32_t layer,
         if (loc == ExpertLocation::L1_VRAM) {
             l1_lru_[layer].bump(e);
         } else if (loc == ExpertLocation::L2_RAM) {
-            _promote(layer, e, ExpertLocation::L2_RAM, ExpertLocation::L1_VRAM);
+            l2_lru_[layer].bump(e);
         } else {
             _promote(layer, e, ExpertLocation::L3_NVME, ExpertLocation::L1_VRAM);
         }
@@ -226,7 +242,37 @@ int32_t ThreeTierCache::_pick_l1_victim(int32_t layer) {
 }
 
 void ThreeTierCache::_log(CacheEvent::Kind kind, int32_t layer, int32_t expert) {
-    if (events_.size() >= MAX_EVENTS) return;  // cap
+    // Update running counters first — these are stats source-of-truth and must
+    // not be lost when events_ is cleared or capped.
+    const bool layer_in_range = layer >= 0 && layer < n_layers_;
+    switch (kind) {
+        case CacheEvent::HIT_L1:
+            total_hits_L1_++;
+            if (layer_in_range) per_layer_hits_L1_[layer]++;
+            break;
+        case CacheEvent::HIT_L2:
+            total_hits_L2_++;
+            if (layer_in_range) per_layer_hits_L2_[layer]++;
+            break;
+        case CacheEvent::MISS_L3:
+            total_misses_L3_++;
+            if (layer_in_range) per_layer_misses_L3_[layer]++;
+            break;
+        case CacheEvent::PROMOTE_L2_TO_L1:
+        case CacheEvent::PROMOTE_L3_TO_L1:
+            total_promotions_to_L1_++;
+            break;
+        case CacheEvent::EVICT_L1_TO_L2:
+            total_evictions_L1_to_L2_++;
+            break;
+        case CacheEvent::EVICT_L2_TO_L3:
+            total_evictions_L2_to_L3_++;
+            break;
+        default: break;
+    }
+
+    // Audit log (bounded). Cap silently — stats survive in the counters above.
+    if (events_.size() >= MAX_EVENTS) return;
     auto now = std::chrono::steady_clock::now().time_since_epoch();
     int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     events_.push_back(CacheEvent{ns, layer, expert, kind});
@@ -235,34 +281,22 @@ void ThreeTierCache::_log(CacheEvent::Kind kind, int32_t layer, int32_t expert) 
 // ---------- stats ----------
 
 CacheStats ThreeTierCache::stats() const {
+    // Read directly from running counters — stats survive clear_events() and
+    // the events_ MAX_EVENTS cap. (Pre-fix this walked events_; would lose data
+    // mid-run at high churn.)
     CacheStats s;
-    s.events_total = events_.size();
-    s.per_layer_hits_L1.assign((size_t)n_layers_, 0);
-    s.per_layer_hits_L2.assign((size_t)n_layers_, 0);
-    s.per_layer_misses_L3.assign((size_t)n_layers_, 0);
-    for (const auto & e : events_) {
-        const bool layer_in_range = e.layer >= 0 && e.layer < n_layers_;
-        switch (e.kind) {
-            case CacheEvent::HIT_L1:
-                s.hits_L1++;
-                if (layer_in_range) s.per_layer_hits_L1[e.layer]++;
-                break;
-            case CacheEvent::HIT_L2:
-                s.hits_L2++;
-                if (layer_in_range) s.per_layer_hits_L2[e.layer]++;
-                break;
-            case CacheEvent::MISS_L3:
-                s.misses_L3++;
-                if (layer_in_range) s.per_layer_misses_L3[e.layer]++;
-                break;
-            case CacheEvent::PROMOTE_L2_TO_L1: s.promotions_to_L1++; break;
-            case CacheEvent::PROMOTE_L3_TO_L1: s.promotions_to_L1++; break;
-            case CacheEvent::EVICT_L1_TO_L2:   s.evictions_L1_to_L2++; break;
-            case CacheEvent::EVICT_L2_TO_L3:   s.evictions_L2_to_L3++; break;
-            default: break;
-        }
-    }
-    uint64_t total_accesses = s.hits_L1 + s.hits_L2 + s.misses_L3;
+    s.events_total        = events_.size();   // audit log size, not a stat per se
+    s.hits_L1             = total_hits_L1_;
+    s.hits_L2             = total_hits_L2_;
+    s.misses_L3           = total_misses_L3_;
+    s.promotions_to_L1    = total_promotions_to_L1_;
+    s.evictions_L1_to_L2  = total_evictions_L1_to_L2_;
+    s.evictions_L2_to_L3  = total_evictions_L2_to_L3_;
+    s.per_layer_hits_L1   = per_layer_hits_L1_;
+    s.per_layer_hits_L2   = per_layer_hits_L2_;
+    s.per_layer_misses_L3 = per_layer_misses_L3_;
+
+    const uint64_t total_accesses = s.hits_L1 + s.hits_L2 + s.misses_L3;
     s.l1_hit_rate = total_accesses ? (double)s.hits_L1 / (double)total_accesses : 0.0;
     return s;
 }
