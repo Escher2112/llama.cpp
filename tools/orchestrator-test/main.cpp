@@ -35,7 +35,9 @@ struct test_args {
     std::string predictor_path;
     std::string hopfield_path;       // --orchestrator-hopfield PATH (L2)
     int         l2_tier2_top_n = 32; // --l2-tier2-top-n N
-    int         tier2_size      = 0; // --tier2-size N (0 = disabled)
+    int         tier2_size      = -1; // --tier2-size N (-1 = auto, 0 = disabled, >0 = explicit)
+    double      tier2_auto_frac = 0.75; // --tier2-auto-frac FRAC (target fraction of n_expert)
+    double      tier2_ram_headroom = 0.40; // --tier2-ram-headroom FRAC
     int         n_batch         = 512; // --n-batch N (smaller = better graceful-mask correctness on prefill)
     bool        mode_b_graceful = false; // --mode-b-graceful: drop -INF mask
     bool        warmup_prompt_centroid = false; // --warmup-prompt-centroid (opt-in; needs layer-0 Hopfield)
@@ -86,7 +88,10 @@ static void print_usage(const char * prog) {
         "  --orchestrator-predictor PATH    .bin predictor file (Mode B: MLP + recency)\n"
         "  --orchestrator-hopfield PATH     L2 Hopfield predictor .bin (per-window prefetch)\n"
         "  --l2-tier2-top-n N               experts per layer Hopfield prefetches (default 32)\n"
-        "  --tier2-size N                   Mode B: pinned host Tier 2 capacity per layer (0 = off)\n"
+        "  --tier2-size N                   Mode B: pinned host Tier 2 capacity per layer\n"
+        "                                   (-1 = auto-size, 0 = disabled, >0 = explicit; default -1)\n"
+        "  --tier2-auto-frac FRAC           target fraction of n_expert for auto sizing (default 0.75)\n"
+        "  --tier2-ram-headroom FRAC        host-RAM headroom reserve for auto sizing (default 0.40)\n"
         "  --mode-b-graceful                drop -INF mask (gate selects freely; pair with Hopfield)\n"
         "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
         "  --l1 N                           L1 (VRAM) cache capacity (per layer; total if --global-l1) (default 32)\n"
@@ -127,6 +132,10 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
                                                 a.l2_tier2_top_n = std::atoi(argv[++i]);
         else if (arg == "--tier2-size" && need("--tier2-size"))
                                                 a.tier2_size = std::atoi(argv[++i]);
+        else if (arg == "--tier2-auto-frac" && need("--tier2-auto-frac"))
+                                                a.tier2_auto_frac = std::atof(argv[++i]);
+        else if (arg == "--tier2-ram-headroom" && need("--tier2-ram-headroom"))
+                                                a.tier2_ram_headroom = std::atof(argv[++i]);
         else if (arg == "--mode-b-graceful")    a.mode_b_graceful = true;
         else if (arg == "--warmup-prompt-centroid") a.warmup_prompt_centroid = true;
         else if (arg == "--n-batch" && need("--n-batch")) a.n_batch = std::atoi(argv[++i]);
@@ -309,7 +318,13 @@ int main(int argc, char ** argv) {
                 if (!mode_b_ctx->init_tier2(args.tier2_size)) {
                     std::fprintf(stderr, "[stage7] Tier 2 init FAILED — continuing without\n");
                 }
+            } else if (args.tier2_size < 0) {
+                // Auto-size from target fraction + RAM budget.
+                if (!mode_b_ctx->init_tier2_auto(args.tier2_auto_frac, args.tier2_ram_headroom)) {
+                    std::fprintf(stderr, "[stage7] Tier 2 auto init FAILED — continuing without\n");
+                }
             }
+            // tier2_size == 0: explicitly disabled, skip Tier 2 entirely.
             // When Mode B is active, force orchestrator-recency-only so the
             // cb_eval bridge gets wired (we use it to observe routing for
             // Mode B's slot cache). Predictor still optional via the existing

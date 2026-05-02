@@ -8,6 +8,7 @@
 #include "ggml-cuda.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -520,6 +521,112 @@ int ModeBContext::refresh_slots() {
 }
 
 // ---- Commit #10: Tier 2 pinned host buffer ----
+
+// Read /proc/meminfo MemAvailable (Linux) and return bytes. Returns 0 on
+// any read failure; caller should treat 0 as "couldn't determine, fall
+// back to a conservative estimate."
+static size_t read_mem_available_bytes() {
+#ifdef __linux__
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t result = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        // Format: "MemAvailable:   12345678 kB\n"
+        if (std::strncmp(line, "MemAvailable:", 13) == 0) {
+            size_t kb = 0;
+            if (std::sscanf(line + 13, " %zu kB", &kb) == 1) {
+                result = kb * 1024;
+            }
+            break;
+        }
+    }
+    std::fclose(f);
+    return result;
+#else
+    return 0;
+#endif
+}
+
+bool ModeBContext::init_tier2_auto(double target_frac, double ram_headroom_frac) {
+    if (!ctx_ || !backend_buffer_) {
+        std::fprintf(stderr, "[mode_b] init_tier2_auto: ModeBContext not initialized\n");
+        return false;
+    }
+    if (n_tier2_ > 0) {
+        std::fprintf(stderr, "[mode_b] init_tier2_auto: already initialized (n_tier2=%d)\n", n_tier2_);
+        return false;
+    }
+    if (target_frac <= 0.0 || target_frac > 1.0) {
+        std::fprintf(stderr, "[mode_b] init_tier2_auto: bad target_frac=%.3f (must be in (0,1])\n",
+                     target_frac);
+        return false;
+    }
+    if (ram_headroom_frac < 0.0 || ram_headroom_frac >= 1.0) {
+        std::fprintf(stderr, "[mode_b] init_tier2_auto: bad ram_headroom_frac=%.3f\n",
+                     ram_headroom_frac);
+        return false;
+    }
+
+    // Per-layer byte cost for one expert across all kinds (up + gate + down).
+    // Sum across active MoE layers to get the per-expert-across-all-layers cost.
+    size_t per_expert_bytes_total = 0;
+    int    active_layers = 0;
+    for (auto & L : layers_) {
+        if (!L.up_slots) continue;
+        active_layers++;
+        per_expert_bytes_total += ggml_nbytes(L.up_slots)   / (size_t)n_slot_;
+        per_expert_bytes_total += ggml_nbytes(L.down_slots) / (size_t)n_slot_;
+        if (L.gate_slots) {
+            per_expert_bytes_total += ggml_nbytes(L.gate_slots) / (size_t)n_slot_;
+        }
+    }
+    if (per_expert_bytes_total == 0) {
+        std::fprintf(stderr, "[mode_b] init_tier2_auto: no MoE layers — nothing to do\n");
+        return false;
+    }
+
+    // Target by fraction.
+    int n_tier2_by_frac = (int)std::round(target_frac * (double)n_expert_);
+
+    // Cap by available host RAM.
+    const size_t mem_avail = read_mem_available_bytes();
+    int n_tier2_by_ram = n_expert_;  // sentinel = no ram cap if we can't query
+    size_t budget = 0;
+    if (mem_avail > 0) {
+        budget = (size_t)((double)mem_avail * (1.0 - ram_headroom_frac));
+        const size_t per_tier2_step_bytes = per_expert_bytes_total;  // adding 1 to n_tier2 costs this
+        if (per_tier2_step_bytes > 0) {
+            n_tier2_by_ram = (int)(budget / per_tier2_step_bytes);
+        }
+    }
+
+    // Apply caps and floor: at minimum keep n_tier2 >= n_slot (otherwise no benefit
+    // over plain Mode B), at maximum n_expert.
+    int n_tier2_capped = std::min({ n_tier2_by_frac, n_tier2_by_ram, n_expert_ });
+    int n_tier2 = std::max(n_tier2_capped, n_slot_);
+
+    const char * cap_reason;
+    if (n_tier2_capped < n_slot_)              cap_reason = "floored at n_slot";
+    else if (n_tier2 == n_expert_)             cap_reason = "saturated to n_expert";
+    else if (mem_avail > 0 &&
+             n_tier2_by_ram < n_tier2_by_frac) cap_reason = "by RAM budget";
+    else                                       cap_reason = "by target fraction";
+
+    std::printf("[mode_b] init_tier2_auto: target_frac=%.2f -> %d, ram_avail=%.1f GB "
+                "(headroom=%.0f%%, budget=%.1f GB) -> %d, %d MoE layers, "
+                "per-expert all-kinds=%.2f MB\n",
+                target_frac, n_tier2_by_frac,
+                mem_avail / (1024.0 * 1024.0 * 1024.0),
+                ram_headroom_frac * 100.0,
+                budget / (1024.0 * 1024.0 * 1024.0),
+                n_tier2_by_ram,
+                active_layers,
+                per_expert_bytes_total / (1024.0 * 1024.0));
+    std::printf("[mode_b]   selected n_tier2=%d (%s)\n", n_tier2, cap_reason);
+
+    return init_tier2(n_tier2);
+}
 
 bool ModeBContext::init_tier2(int n_tier2) {
     if (!ctx_ || !backend_buffer_) {

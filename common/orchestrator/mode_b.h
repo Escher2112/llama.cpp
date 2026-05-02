@@ -196,6 +196,21 @@ public:
     // for {up, gate, down}. Returns false if allocation fails. May be called
     // any time after init(). n_tier2 should be > n_slot (typical: 2-3x).
     bool init_tier2(int n_tier2);
+
+    // Auto-size Tier 2 from a target fraction of n_expert, capped by
+    // available host RAM. Computes per-expert byte cost from the loaded
+    // slot tensors, queries /proc/meminfo for MemAvailable, leaves
+    // ram_headroom_frac of available RAM unallocated (default 0.40 =
+    // 40% reserved for KV cache, activations, OS), and clamps the
+    // resulting n_tier2 to [n_slot, n_expert].
+    //
+    // target_frac defaults to 0.75 (the "second-sigma" coverage from the
+    // patent disclosure six-sigma framing). On smaller models / boxes
+    // this often hits the n_expert ceiling; on frontier models (235B+)
+    // it usually hits the RAM ceiling.
+    bool init_tier2_auto(double target_frac = 0.75,
+                         double ram_headroom_frac = 0.40);
+
     int  n_tier2() const { return n_tier2_; }
     bool tier2_active() const { return n_tier2_ > 0; }
 
