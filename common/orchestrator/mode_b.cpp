@@ -8,6 +8,7 @@
 #include "ggml-cuda.h"
 #include "llama.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -35,8 +36,8 @@ bool ModeBContext::init(const llama_model * model,
 
     // ggml_context with no_alloc; we'll use a single CUDA backend buffer for
     // the data. Tensor count: per layer we have up_slots + gate_slots +
-    // down_slots + slot_map = 4. Plus slack.
-    const size_t n_tensors = (size_t)n_layer * 4 + 8;
+    // down_slots + slot_map + valid_mask = 5. Plus slack.
+    const size_t n_tensors = (size_t)n_layer * 5 + 16;
     struct ggml_init_params iparams = {};
     iparams.mem_size   = ggml_tensor_overhead() * n_tensors;
     iparams.mem_buffer = nullptr;
@@ -89,7 +90,8 @@ bool ModeBContext::init(const llama_model * model,
         if (gate_t) {
             layers_[il].gate_slots = ggml_new_tensor_3d(ctx_, gate_t->type, gate_t->ne[0], gate_t->ne[1], n_slot);
         }
-        layers_[il].slot_map = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_expert);
+        layers_[il].slot_map   = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_expert);
+        layers_[il].valid_mask = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, n_expert);
 
         // Set debug names for traceability in graph dumps.
         char dbg[64];
@@ -98,12 +100,14 @@ bool ModeBContext::init(const llama_model * model,
         if (layers_[il].gate_slots) {
             std::snprintf(dbg, sizeof(dbg), "moe_orch.gate_slots.layer_%d", il); ggml_set_name(layers_[il].gate_slots, dbg);
         }
-        std::snprintf(dbg, sizeof(dbg), "moe_orch.slot_map.layer_%d", il); ggml_set_name(layers_[il].slot_map, dbg);
+        std::snprintf(dbg, sizeof(dbg), "moe_orch.slot_map.layer_%d",   il); ggml_set_name(layers_[il].slot_map, dbg);
+        std::snprintf(dbg, sizeof(dbg), "moe_orch.valid_mask.layer_%d", il); ggml_set_name(layers_[il].valid_mask, dbg);
 
         total_slot_bytes += ggml_nbytes(layers_[il].up_slots);
         total_slot_bytes += ggml_nbytes(layers_[il].down_slots);
         if (layers_[il].gate_slots) total_slot_bytes += ggml_nbytes(layers_[il].gate_slots);
         total_slot_bytes += ggml_nbytes(layers_[il].slot_map);
+        total_slot_bytes += ggml_nbytes(layers_[il].valid_mask);
     }
 
     // Allocate the single backend buffer covering all tensors in ctx_.
@@ -179,19 +183,30 @@ bool ModeBContext::init(const llama_model * model,
     }
 
     // Initial slot_map: experts 0..n_slot-1 → slots 0..n_slot-1 (identity);
-    // experts n_slot..n_expert-1 → slot 0 (sentinel — they read slot 0's
-    // weights, which is "wrong but bounded" output. commit #6 adds a real
-    // page-on-miss path). The orchestrator's predictor will update this
-    // dynamically in commit #6 to reflect actual cache contents.
+    // experts n_slot..n_expert-1 → slot 0 (sentinel). With cache-aware
+    // gating (the valid_mask tensor) the gate masks uncached experts to
+    // -INFINITY before argsort_top_k, so the gate can't actually select
+    // them. The slot 0 sentinel is just a never-read fallback.
     std::vector<int32_t> initial_map(n_expert, 0);
     for (int e = 0; e < n_expert && e < n_slot; e++) {
         initial_map[e] = e;
+    }
+    // Initial valid_mask: 0 for cached (slots 0..n_slot-1 hold experts
+    // 0..n_slot-1), -INFINITY for uncached. This makes the gate naturally
+    // pick only from the cached set after init.
+    std::vector<float> initial_mask(n_expert, -INFINITY);
+    for (int e = 0; e < n_expert && e < n_slot; e++) {
+        initial_mask[e] = 0.0f;
     }
     for (int il = 0; il < n_layer; il++) {
         if (!layers_[il].slot_map) continue;
         if (!set_slot_map(il, initial_map.data())) {
             std::fprintf(stderr, "[mode_b] init: set_slot_map failed at layer %d\n", il);
             return false;
+        }
+        if (layers_[il].valid_mask) {
+            ggml_backend_tensor_set(layers_[il].valid_mask, initial_mask.data(),
+                                    0, (size_t)n_expert * sizeof(float));
         }
     }
 
@@ -235,6 +250,11 @@ ggml_tensor * ModeBContext::down_slots(int layer) const {
 ggml_tensor * ModeBContext::slot_map(int layer) const {
     if (layer < 0 || layer >= (int)layers_.size()) return nullptr;
     return layers_[layer].slot_map;
+}
+
+ggml_tensor * ModeBContext::valid_mask(int layer) const {
+    if (layer < 0 || layer >= (int)layers_.size()) return nullptr;
+    return layers_[layer].valid_mask;
 }
 
 bool ModeBContext::set_slot_map(int layer, const int32_t * map) {
@@ -431,13 +451,21 @@ int ModeBContext::refresh_slots() {
         }
         L.dirty.clear();
 
-        // If the slot occupancy changed, rebuild slot_map for this layer.
+        // If the slot occupancy changed, rebuild slot_map AND valid_mask
+        // for this layer. valid_mask drives cache-aware gating: experts
+        // not in cache get -INFINITY logit so the gate can't select them.
         if (L.slot_map_dirty || updates > 0) {
+            std::vector<float> mask_buf((size_t)n_expert_, -INFINITY);
             for (int e = 0; e < n_expert_; e++) {
                 int32_t s = L.expert_to_slot[e];
-                map_buf[(size_t)e] = (s >= 0) ? s : 0;  // sentinel: slot 0 (commit #6 fallback)
+                map_buf[(size_t)e] = (s >= 0) ? s : 0;
+                if (s >= 0) mask_buf[(size_t)e] = 0.0f;
             }
             set_slot_map((int)il, map_buf.data());
+            if (L.valid_mask) {
+                ggml_backend_tensor_set(L.valid_mask, mask_buf.data(),
+                                        0, (size_t)n_expert_ * sizeof(float));
+            }
             L.slot_map_dirty = false;
         }
     }

@@ -35,6 +35,7 @@ struct ModeBLayer {
     ggml_tensor * gate_slots = nullptr;     // [n_ff, n_embd, n_slot] (or nullptr if model is fused)
     ggml_tensor * down_slots = nullptr;     // [n_embd, n_ff, n_slot]
     ggml_tensor * slot_map   = nullptr;     // [n_expert] of int32 slot indices
+    ggml_tensor * valid_mask = nullptr;     // [n_expert] of float: 0 if cached, -INF if uncached
 
     // Runtime cache state. Mirrors the slot tensor occupancy on the CPU
     // side so we can compute the diff between desired and current contents.
@@ -94,6 +95,7 @@ public:
     ggml_tensor * gate_slots(int layer) const;
     ggml_tensor * down_slots(int layer) const;
     ggml_tensor * slot_map  (int layer) const;
+    ggml_tensor * valid_mask(int layer) const;
 
     int n_layer() const { return (int)layers_.size(); }
     int n_slot()  const { return n_slot_; }

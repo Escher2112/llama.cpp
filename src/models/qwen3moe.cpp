@@ -89,11 +89,13 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         ggml_tensor * up_use   = model.layers[il].ffn_up_exps;
         ggml_tensor * gate_use = model.layers[il].ffn_gate_exps;
         ggml_tensor * down_use = model.layers[il].ffn_down_exps;
-        ggml_tensor * mb_slot_map = nullptr;
+        ggml_tensor * mb_slot_map   = nullptr;
+        ggml_tensor * mb_valid_mask = nullptr;
 #ifdef LLAMA_ORCHESTRATOR_BUILD
         if (auto * mb = moe_orch::get_mode_b_context()) {
             if (mb->active()) {
-                mb_slot_map = mb->slot_map(il);
+                mb_slot_map   = mb->slot_map(il);
+                mb_valid_mask = mb->valid_mask(il);
                 if (mb->up_slots(il))   up_use   = mb->up_slots(il);
                 if (mb->gate_slots(il)) gate_use = mb->gate_slots(il);
                 if (mb->down_slots(il)) down_use = mb->down_slots(il);
@@ -117,7 +119,8 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
                     model.layers[il].ffn_down_exps_s,
-                    mb_slot_map);
+                    mb_slot_map,
+                    mb_valid_mask);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

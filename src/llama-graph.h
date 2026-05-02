@@ -858,7 +858,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * slot_map = nullptr) const;
+             ggml_tensor * slot_map = nullptr,
+             ggml_tensor * valid_mask = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -884,7 +885,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * slot_map = nullptr) const;  // see comment on the no-bias overload
+             ggml_tensor * slot_map = nullptr,
+             ggml_tensor * valid_mask = nullptr) const;  // see comment on the no-bias overload
 
     //
     // inputs

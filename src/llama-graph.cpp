@@ -1321,7 +1321,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * slot_map) const {
+         ggml_tensor * slot_map,
+         ggml_tensor * valid_mask) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1342,7 +1343,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        slot_map
+        slot_map,
+        valid_mask
     );
 }
 
@@ -1370,7 +1372,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * slot_map) const {
+         ggml_tensor * slot_map,
+         ggml_tensor * valid_mask) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1450,6 +1453,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
         selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_masked", il);
+    }
+
+    // Mode B cache-aware gating: when valid_mask is non-null, add it to
+    // selection_probs before argsort_top_k. valid_mask is [n_expert] of
+    // float, with 0 for cached experts and -INFINITY for uncached. After
+    // adding, uncached experts have -INFINITY logits, so argsort_top_k
+    // can never select them. The gate's preference is constrained to the
+    // currently-cached set (which the orchestrator + predictor have
+    // arranged to match the gate's preferences as closely as possible).
+    //
+    // This makes Mode B output coherent: every selected expert is cached,
+    // so the slot_map remap never falls back to a sentinel slot.
+    //
+    // The result tensor selection_probs gets a per-token broadcast of the
+    // [n_expert] mask. ggml_add handles broadcast when shape compatibility
+    // works; if not, ggml_repeat first.
+    if (valid_mask != nullptr) {
+        // Reshape mask to [n_expert, 1] to broadcast across n_tokens dim.
+        ggml_tensor * mask_b = ggml_reshape_2d(ctx0, valid_mask, n_expert, 1);
+        mask_b = ggml_repeat(ctx0, mask_b, selection_probs);
+        selection_probs = ggml_add(ctx0, selection_probs, mask_b);
+        cb(selection_probs, "ffn_moe_probs_mode_b_masked", il);
     }
 
     // select experts
