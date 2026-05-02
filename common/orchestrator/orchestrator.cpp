@@ -18,7 +18,7 @@ namespace moe_orch {
 
 Orchestrator::Orchestrator(const OrchestratorConfig &  config,
                            const std::string &         predictor_mlp_bin_path,
-                           const std::string &         /*predictor_hopfield_bin_path*/,
+                           const std::string &         predictor_hopfield_bin_path,
                            int32_t                     n_layers,
                            int32_t                     n_experts_per_layer,
                            int32_t                     hidden_dim)
@@ -46,9 +46,23 @@ Orchestrator::Orchestrator(const OrchestratorConfig &  config,
                      predictor_mlp_bin_path.c_str());
     }
 
-    // L2 Hopfield predictor: stub for v0 — wire up once shadow run validates L1 path.
-    // l2_predictor_available_ stays false; _refresh_l2() is a no-op.
-    // TODO(day-6): instantiate HopfieldPredictor and load from predictor_hopfield_bin_path.
+    // L2 Hopfield predictor. Optional — empty path = no L2 prefetch.
+    if (predictor_hopfield_bin_path.empty()) {
+        l2_predictor_available_ = false;
+        std::fprintf(stderr, "[orchestrator] no L2 (Hopfield) predictor configured\n");
+    } else if (l2_predictor_.load(predictor_hopfield_bin_path.c_str())) {
+        l2_predictor_available_ = true;
+        std::fprintf(stderr,
+                     "[orchestrator] L2 Hopfield loaded: n_patterns=%u hidden_dim=%u "
+                     "n_experts=%u n_layers=%u beta=%.3f\n",
+                     l2_predictor_.n_patterns(), l2_predictor_.hidden_dim(),
+                     l2_predictor_.n_experts(), l2_predictor_.n_layers(),
+                     l2_predictor_.beta());
+    } else {
+        l2_predictor_available_ = false;
+        std::fprintf(stderr, "[orchestrator] failed to load L2 Hopfield from %s\n",
+                     predictor_hopfield_bin_path.c_str());
+    }
 
     embedding_window_.reserve(config.embedding_window_tokens);
     scratch_top_.resize(config.l1_prefetch_top_k);
@@ -166,16 +180,65 @@ void Orchestrator::on_routing_weights(int32_t layer, const float * weights, int3
 }
 
 void Orchestrator::_refresh_l2() {
-    // v0 stub: when HopfieldPredictor is wired up, this computes the running
-    // conversation embedding (mean of embedding_window_), queries Hopfield for
-    // each layer's top-N experts, and prefetches them into L2.
-    //
-    // Until then, L2 only fills via L1 evictions. That gives us a "natural"
-    // L2 set based on what was hot recently — not optimal, but correct.
-    if (!l2_predictor_available_) return;
+    // Compute running conversation embedding = mean of embedding_window_.
+    // Query Hopfield per layer for top-N experts, push them into the cache's
+    // L2 prefetch path AND mode_b's mark_predicted (preemptive Tier 2 set).
+    if (!l2_predictor_available_ || embedding_window_.empty()) return;
 
-    // (Not yet implemented — see TODO in ctor.)
+    auto t0 = std::chrono::steady_clock::now();
+
+    const int32_t H = (int32_t)l2_predictor_.hidden_dim();
+    if (H != hidden_dim_) {
+        // Dimension mismatch: silently noop to avoid bad reads. Surface once.
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr, "[orchestrator] Hopfield hidden_dim=%d != model hidden_dim=%d, "
+                                 "L2 disabled\n", H, hidden_dim_);
+            warned = true;
+        }
+        return;
+    }
+
+    std::vector<float> centroid((size_t)H, 0.0f);
+    for (const auto & v : embedding_window_) {
+        for (int32_t i = 0; i < H; i++) centroid[i] += v[i];
+    }
+    const float norm = embedding_window_.empty() ? 1.0f : (1.0f / (float)embedding_window_.size());
+    for (int32_t i = 0; i < H; i++) centroid[i] *= norm;
+
+    const int32_t top_n = std::max(1, config_.l2_tier2_top_n);
+    std::vector<int32_t> top((size_t)top_n);
+
+    moe_orch::ModeBContext * mb = moe_orch::get_mode_b_context();
+
+    int32_t layers_queried = 0;
+    for (int32_t L = 0; L < n_layers_; L++) {
+        if (!l2_predictor_.has_layer(L)) continue;
+        if (!l2_predictor_.predict_top_n(L, centroid.data(), top_n, top.data())) continue;
+        // Cache prefetch (shadow-mode bookkeeping)
+        cache_.prefetch_to_l2(L, top.data(), top_n);
+        // Mode B: mark these as predicted so refresh_slots warms the slot pool
+        // ahead of the gate's actual selection. Without graceful-mask this is
+        // moot; with graceful-mask this is the load-bearing prefetch path.
+        if (mb && mb->active()) {
+            mb->mark_predicted(L, top.data(), top_n);
+        }
+        layers_queried++;
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    l2_predictor_total_ns_ +=
+        (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     l2_predictor_calls_++;
+
+    static bool first = true;
+    if (first) {
+        std::fprintf(stderr, "[orchestrator] L2 refresh: queried %d layers, top_n=%d, "
+                             "elapsed %.2f ms\n",
+                     layers_queried, top_n,
+                     (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0);
+        first = false;
+    }
 }
 
 // ============================================================================

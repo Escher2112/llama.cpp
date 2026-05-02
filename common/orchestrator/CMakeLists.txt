@@ -4,6 +4,7 @@
 
 add_library(moe_orchestrator STATIC
     predictor.cpp
+    hopfield.cpp
     cache.cpp
     orchestrator.cpp
     mode_b.cpp
@@ -29,3 +30,6 @@ target_link_libraries(moe_orchestrator PUBLIC ggml-base)
 # Optional sanity-test executable.
 add_executable(orchestrator-test-predict test_predict.cpp)
 target_link_libraries(orchestrator-test-predict PRIVATE moe_orchestrator)
+
+add_executable(orchestrator-test-hopfield test_hopfield.cpp)
+target_link_libraries(orchestrator-test-hopfield PRIVATE moe_orchestrator)

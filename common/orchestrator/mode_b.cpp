@@ -191,12 +191,18 @@ bool ModeBContext::init(const llama_model * model,
     for (int e = 0; e < n_expert && e < n_slot; e++) {
         initial_map[e] = e;
     }
-    // Initial valid_mask: 0 for cached (slots 0..n_slot-1 hold experts
-    // 0..n_slot-1), -INFINITY for uncached. This makes the gate naturally
-    // pick only from the cached set after init.
-    std::vector<float> initial_mask(n_expert, -INFINITY);
-    for (int e = 0; e < n_expert && e < n_slot; e++) {
-        initial_mask[e] = 0.0f;
+    // Initial valid_mask. Two regimes:
+    //   - graceful_mask_ OFF (default): -INFINITY for uncached experts. Hard
+    //     constraint — gate picks from cached set only. Mode-collapse-prone
+    //     at small n_slot.
+    //   - graceful_mask_ ON: all zeros. Gate selects freely. Cache misses go
+    //     through the page-on-demand fallback. Pair with Hopfield prefetch
+    //     for the Tier-2-set keeping the resident pool warm.
+    std::vector<float> initial_mask(n_expert, graceful_mask_ ? 0.0f : -INFINITY);
+    if (!graceful_mask_) {
+        for (int e = 0; e < n_expert && e < n_slot; e++) {
+            initial_mask[e] = 0.0f;
+        }
     }
     for (int il = 0; il < n_layer; il++) {
         if (!layers_[il].slot_map) continue;
@@ -452,14 +458,16 @@ int ModeBContext::refresh_slots() {
         L.dirty.clear();
 
         // If the slot occupancy changed, rebuild slot_map AND valid_mask
-        // for this layer. valid_mask drives cache-aware gating: experts
-        // not in cache get -INFINITY logit so the gate can't select them.
+        // for this layer. valid_mask carries -INFINITY for uncached experts
+        // when graceful_mask_ is OFF (hard cache-aware gating); when ON, it's
+        // all zeros (gate selects freely, page-on-demand handles misses).
         if (L.slot_map_dirty || updates > 0) {
-            std::vector<float> mask_buf((size_t)n_expert_, -INFINITY);
+            std::vector<float> mask_buf((size_t)n_expert_,
+                                        graceful_mask_ ? 0.0f : -INFINITY);
             for (int e = 0; e < n_expert_; e++) {
                 int32_t s = L.expert_to_slot[e];
                 map_buf[(size_t)e] = (s >= 0) ? s : 0;
-                if (s >= 0) mask_buf[(size_t)e] = 0.0f;
+                if (!graceful_mask_ && s >= 0) mask_buf[(size_t)e] = 0.0f;
             }
             set_slot_map((int)il, map_buf.data());
             if (L.valid_mask) {

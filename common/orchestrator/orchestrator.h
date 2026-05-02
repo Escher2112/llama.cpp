@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "cache.h"
+#include "hopfield.h"
 #include "predictor.h"
 
 namespace moe_orch {
@@ -55,6 +56,13 @@ struct OrchestratorConfig {
     // This is the L1-hit-rate lift required for live mode where L1 is small
     // physical VRAM and L1 misses cost a real cudaMemcpyAsync.
     float   l2_promote_threshold   = -1.0f;
+
+    // L2 (Hopfield) → Tier 2 working set. When > 0, the orchestrator queries
+    // Hopfield each refresh window and feeds mode_b's mark_predicted with this
+    // many experts per layer. Pairs with mode_b's graceful-mask path: the gate
+    // selects freely from all experts, but the prefetched Tier 2 set keeps the
+    // cache hot ahead of the gate's actual decision.
+    int32_t l2_tier2_top_n         = 32;
 
     // Trace dump (offline predictor training data). Empty path = disabled.
     // When set, the orchestrator writes a binary trace of every
@@ -118,7 +126,7 @@ private:
 
     MLPPredictor       l1_predictor_;
     bool               l1_predictor_loaded_   = false;
-    // TODO: HopfieldPredictor l2_predictor_;  — v0 stub (pass-through), wire after shadow test
+    HopfieldPredictor  l2_predictor_;
     bool               l2_predictor_available_ = false;
 
     ThreeTierCache     cache_;

@@ -102,6 +102,20 @@ public:
     int n_expert() const { return n_expert_; }
     bool active() const { return ctx_ != nullptr && backend_buffer_ != nullptr; }
 
+    // ---- Graceful-mask mode (commit #9) ----
+    //
+    // When OFF (default for backwards-compat): valid_mask carries -INFINITY
+    // for uncached experts, so the gate is hard-constrained to pick from the
+    // resident set. This is mode-collapse-prone at small n_slot.
+    //
+    // When ON: valid_mask is ALL ZEROS — gate selects freely. Cache misses
+    // are handled by page-on-demand (slow Tier 3) or, if Hopfield+Tier 2 is
+    // active, by fast PCIe swap from the pinned buffer. Pairs with the
+    // orchestrator's Hopfield-driven mark_predicted to keep the resident set
+    // hot ahead of the gate's actual decisions.
+    void set_graceful_mask(bool g) { graceful_mask_ = g; }
+    bool graceful_mask() const     { return graceful_mask_; }
+
     // Populate the slot_map tensor for `layer` from a host-side int32 array
     // of length n_expert (entries are slot indices in [0, n_slot)). Wraps
     // ggml_backend_tensor_set. Caller must have already populated the
@@ -165,6 +179,7 @@ private:
     int n_slot_   = 0;
     int n_expert_ = 0;
     int device_id_ = 0;
+    bool graceful_mask_ = false;
     ggml_context *           ctx_            = nullptr;
     ggml_backend_buffer_t    backend_buffer_ = nullptr;
     std::vector<ModeBLayer>  layers_;

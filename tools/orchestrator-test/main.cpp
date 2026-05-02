@@ -32,6 +32,9 @@ struct test_args {
     std::string model_path;
     std::string prompt           = "Why is the sky blue?";
     std::string predictor_path;
+    std::string hopfield_path;       // --orchestrator-hopfield PATH (L2)
+    int         l2_tier2_top_n = 32; // --l2-tier2-top-n N
+    bool        mode_b_graceful = false; // --mode-b-graceful: drop -INF mask
     int         n_predict        = 30;
     int         n_gpu_layers      = 99;
     int         n_threads         = 24;
@@ -77,6 +80,9 @@ static void print_usage(const char * prog) {
         "  -t N                             CPU threads (default 24)\n"
         "  -c N                             context size (default 4096)\n"
         "  --orchestrator-predictor PATH    .bin predictor file (Mode B: MLP + recency)\n"
+        "  --orchestrator-hopfield PATH     L2 Hopfield predictor .bin (per-window prefetch)\n"
+        "  --l2-tier2-top-n N               experts per layer Hopfield prefetches (default 32)\n"
+        "  --mode-b-graceful                drop -INF mask (gate selects freely; pair with Hopfield)\n"
         "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
         "  --l1 N                           L1 (VRAM) cache capacity (per layer; total if --global-l1) (default 32)\n"
         "  --l2 N                           L2 (RAM)  cache capacity per layer (default 80)\n"
@@ -110,6 +116,11 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "-c"   && need("-c"))   a.ctx_size       = std::atoi(argv[++i]);
         else if (arg == "--orchestrator-predictor" && need("--orchestrator-predictor"))
                                                 a.predictor_path = argv[++i];
+        else if (arg == "--orchestrator-hopfield" && need("--orchestrator-hopfield"))
+                                                a.hopfield_path = argv[++i];
+        else if (arg == "--l2-tier2-top-n" && need("--l2-tier2-top-n"))
+                                                a.l2_tier2_top_n = std::atoi(argv[++i]);
+        else if (arg == "--mode-b-graceful")    a.mode_b_graceful = true;
         else if (arg == "--orchestrator-recency-only") a.orchestrator_recency_only = true;
         else if (arg == "--l1" && need("--l1")) a.l1_capacity = std::atoi(argv[++i]);
         else if (arg == "--l2" && need("--l2")) a.l2_capacity = std::atoi(argv[++i]);
@@ -241,8 +252,10 @@ int main(int argc, char ** argv) {
             mode_b_ctx.reset();
         } else {
             mode_b_ctx->attach_model(model);
+            mode_b_ctx->set_graceful_mask(args.mode_b_graceful);
             moe_orch::set_mode_b_context(mode_b_ctx.get());
-            std::printf("[stage7] Mode B context active for graph build\n");
+            std::printf("[stage7] Mode B context active for graph build (graceful_mask=%s)\n",
+                        args.mode_b_graceful ? "ON" : "OFF");
             // When Mode B is active, force orchestrator-recency-only so the
             // cb_eval bridge gets wired (we use it to observe routing for
             // Mode B's slot cache). Predictor still optional via the existing
@@ -269,8 +282,9 @@ int main(int argc, char ** argv) {
         cfg.global_l1 = args.global_l1;
         cfg.l2_promote_threshold = args.l2_promote_threshold;
         cfg.dump_trace_path = args.dump_trace_path;
+        cfg.l2_tier2_top_n = args.l2_tier2_top_n;
         orchestrator = std::make_unique<moe_orch::Orchestrator>(
-            cfg, args.predictor_path, /*hopfield=*/"",
+            cfg, args.predictor_path, args.hopfield_path,
             n_layers, n_experts, hidden_dim);
         if (!args.dump_trace_path.empty() && args.predictor_path.empty() && !args.orchestrator_recency_only) {
             mode_label = "TRACE-CAPTURE (no cache stats meaningful)";
@@ -288,7 +302,11 @@ int main(int argc, char ** argv) {
             std::printf("  l2->l1 promote threshold: %.3f\n", args.l2_promote_threshold);
         }
         if (!args.predictor_path.empty()) {
-            std::printf("  predictor: %s\n", args.predictor_path.c_str());
+            std::printf("  L1 predictor (MLP): %s\n", args.predictor_path.c_str());
+        }
+        if (!args.hopfield_path.empty()) {
+            std::printf("  L2 predictor (Hopfield): %s  tier2_top_n=%d\n",
+                        args.hopfield_path.c_str(), args.l2_tier2_top_n);
         }
         if (!args.dump_trace_path.empty()) {
             std::printf("  trace dump: %s\n", args.dump_trace_path.c_str());
