@@ -59,6 +59,25 @@ struct ModeBLayer {
     // by deduping against lru.
     std::vector<int32_t> dirty;
     bool                 slot_map_dirty = false;
+
+    // ---- Tier 2 (pinned host) cache (commit #10) ----
+    //
+    // Three buffers (up/gate/down) of size n_tier2 * per_expert_bytes each,
+    // backed by CUDA pinned host memory (cudaHostAlloc) for fast PCIe DMA
+    // into the device-side slot tensors. Populated by promote_to_tier2()
+    // from the CPU mirror; consumed by _page_in_expert() as a fast source.
+    //
+    // Lifetime: allocated when ModeBContext::init_tier2(n_tier2) is called.
+    // Empty otherwise — _page_in_expert falls back to CPU mirror.
+    void *               tier2_up_buf   = nullptr;
+    void *               tier2_gate_buf = nullptr;
+    void *               tier2_down_buf = nullptr;
+
+    // Tier 2 occupancy. Same shape as Tier 1 but n_tier2 entries.
+    std::vector<int32_t> tier2_to_expert;
+    std::vector<int32_t> expert_to_tier2;
+    // Round-robin write pointer for tier 2 evictions (FIFO; refined later).
+    int32_t              tier2_next_write = 0;
 };
 
 class ModeBContext {
@@ -171,6 +190,26 @@ public:
     // Returns the number of slot updates made (for diagnostics).
     int refresh_slots();
 
+    // ---- Tier 2 pinned host buffer (commit #10) ----
+    //
+    // Allocate per-layer pinned host buffers of size n_tier2 * per_expert_bytes
+    // for {up, gate, down}. Returns false if allocation fails. May be called
+    // any time after init(). n_tier2 should be > n_slot (typical: 2-3x).
+    bool init_tier2(int n_tier2);
+    int  n_tier2() const { return n_tier2_; }
+    bool tier2_active() const { return n_tier2_ > 0; }
+
+    // Promote experts to Tier 2 (copy from CPU mirror into pinned host buffer).
+    // Idempotent: if expert is already in Tier 2, no copy is performed.
+    // Returns the number of new (non-cached) Tier 2 promotions performed.
+    int promote_to_tier2(int layer, const int32_t * experts, int count);
+
+    // Helper: query Tier 2 occupancy.
+    int  tier2_index(int layer, int expert) const;     // -1 if absent
+
+    uint64_t total_tier2_promotions() const { return total_tier2_promotions_; }
+    uint64_t total_pages_from_tier2() const { return total_pages_from_tier2_; }
+
     // Diagnostics
     uint64_t total_pages_in() const { return total_pages_in_; }
     uint64_t total_evictions() const { return total_evictions_; }
@@ -178,6 +217,7 @@ public:
 private:
     int n_slot_   = 0;
     int n_expert_ = 0;
+    int n_tier2_  = 0;
     int device_id_ = 0;
     bool graceful_mask_ = false;
     ggml_context *           ctx_            = nullptr;
@@ -187,6 +227,8 @@ private:
     // Counters for diagnostics
     uint64_t total_pages_in_  = 0;
     uint64_t total_evictions_ = 0;
+    uint64_t total_tier2_promotions_ = 0;
+    uint64_t total_pages_from_tier2_ = 0;
 
     // Scratch buffer reused across page-in operations to avoid allocations.
     std::vector<uint8_t> scratch_;

@@ -179,6 +179,42 @@ void Orchestrator::on_routing_weights(int32_t layer, const float * weights, int3
     }
 }
 
+bool Orchestrator::warm_up_from_prompt_centroid(const float * centroid) {
+    if (!l2_predictor_available_ || !centroid) return false;
+
+    auto t0 = std::chrono::steady_clock::now();
+    const int32_t H = (int32_t)l2_predictor_.hidden_dim();
+    if (H != hidden_dim_) {
+        std::fprintf(stderr, "[orchestrator] warm_up: hidden_dim mismatch (%d vs %d)\n",
+                     H, hidden_dim_);
+        return false;
+    }
+    const int32_t top_n = std::max(1, config_.l2_tier2_top_n);
+    std::vector<int32_t> top((size_t)top_n);
+    moe_orch::ModeBContext * mb = moe_orch::get_mode_b_context();
+
+    int32_t layers_warmed = 0;
+    int32_t total_promoted = 0;
+    for (int32_t L = 0; L < n_layers_; L++) {
+        if (!l2_predictor_.has_layer(L)) continue;
+        if (!l2_predictor_.predict_top_n(L, centroid, top_n, top.data())) continue;
+        cache_.prefetch_to_l2(L, top.data(), top_n);
+        if (mb && mb->active()) {
+            mb->mark_predicted(L, top.data(), top_n);
+            if (mb->tier2_active()) {
+                total_promoted += mb->promote_to_tier2(L, top.data(), top_n);
+            }
+        }
+        layers_warmed++;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    std::printf("[orchestrator] warmup: queried %d layers, top_n=%d, %d Tier 2 promotions, "
+                "%.2f ms\n",
+                layers_warmed, top_n, total_promoted,
+                (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0);
+    return true;
+}
+
 void Orchestrator::_refresh_l2() {
     // Compute running conversation embedding = mean of embedding_window_.
     // Query Hopfield per layer for top-N experts, push them into the cache's
@@ -218,10 +254,14 @@ void Orchestrator::_refresh_l2() {
         // Cache prefetch (shadow-mode bookkeeping)
         cache_.prefetch_to_l2(L, top.data(), top_n);
         // Mode B: mark these as predicted so refresh_slots warms the slot pool
-        // ahead of the gate's actual selection. Without graceful-mask this is
-        // moot; with graceful-mask this is the load-bearing prefetch path.
+        // ahead of the gate's actual selection. AND if Tier 2 (pinned host
+        // buffer) is active, promote into Tier 2 so the page-in path uses
+        // the fast PCIe-pinned source.
         if (mb && mb->active()) {
             mb->mark_predicted(L, top.data(), top_n);
+            if (mb->tier2_active()) {
+                mb->promote_to_tier2(L, top.data(), top_n);
+            }
         }
         layers_queried++;
     }

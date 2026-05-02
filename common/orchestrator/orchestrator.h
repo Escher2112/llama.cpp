@@ -109,6 +109,17 @@ public:
     // Test-only access
     const ThreeTierCache & cache() const { return cache_; }
 
+    // Pre-prefill warmup. Caller hands a CPU-resident `hidden_dim`-sized
+    // centroid (e.g., the mean of the prompt's token embeddings looked up
+    // via the model's tok_embd table) BEFORE the first llama_decode runs.
+    // The orchestrator queries Hopfield per layer with this centroid and
+    // populates Tier 2 + the dirty queue. A subsequent refresh_slots() call
+    // then pages experts into Tier 1 ahead of prefill — fixing the cold-cache
+    // mode-collapse problem at small n_slot.
+    //
+    // Returns true if Hopfield is loaded and warmup ran; false otherwise.
+    bool warm_up_from_prompt_centroid(const float * centroid);
+
     // Drop the cache event log — call between prompts in a multi-prompt run.
     // The events_ vector accumulates across the entire run otherwise; at high
     // churn (Mode B + tight cache) it hits its 4M cap and the surrounding heap

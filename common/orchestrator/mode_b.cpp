@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -227,6 +228,19 @@ bool ModeBContext::init(const llama_model * model,
 }
 
 ModeBContext::~ModeBContext() {
+    // Free per-layer pinned host buffers (Tier 2). Order matters:
+    // unregister with CUDA before freeing the heap allocation.
+    for (auto & L : layers_) {
+        auto release = [](void *& p) {
+            if (!p) return;
+            ggml_backend_cuda_unregister_host_buffer(p);
+            std::free(p);
+            p = nullptr;
+        };
+        release(L.tier2_up_buf);
+        release(L.tier2_gate_buf);
+        release(L.tier2_down_buf);
+    }
     if (backend_buffer_) {
         ggml_backend_buffer_free(backend_buffer_);
         backend_buffer_ = nullptr;
@@ -404,20 +418,36 @@ bool ModeBContext::_page_in_expert(int layer, int expert, int slot) {
     auto & L = layers_[layer];
     if (slot < 0 || slot >= n_slot_) return false;
 
-    auto copy_one = [&](ggml_tensor * src, ggml_tensor * dst) -> bool {
+    // Fast path: if expert is in Tier 2 (pinned host buffer), copy directly
+    // from there to slot via tensor_set. Pinned source enables CUDA's
+    // page-locked DMA → measurably faster than from a random heap allocation.
+    const int t2 = (n_tier2_ > 0) ? L.expert_to_tier2[(size_t)expert] : -1;
+
+    auto copy_one = [&](ggml_tensor * src, ggml_tensor * dst,
+                        void * tier2_buf) -> bool {
         if (!src || !dst) return true;  // optional (e.g., gate)
         const size_t per_expert = ggml_nbytes(src) / (size_t)n_expert_;
         const size_t per_slot   = ggml_nbytes(dst) / (size_t)n_slot_;
         if (per_expert != per_slot) return false;
-        if (scratch_.size() < per_expert) scratch_.resize(per_expert);
-        ggml_backend_tensor_get(src, scratch_.data(), (size_t)expert * per_expert, per_expert);
-        ggml_backend_tensor_set(dst, scratch_.data(), (size_t)slot * per_slot, per_slot);
+        if (t2 >= 0 && tier2_buf) {
+            // Tier 2 → slot. Pinned host source.
+            const uint8_t * src_ptr =
+                (const uint8_t *)tier2_buf + (size_t)t2 * per_expert;
+            ggml_backend_tensor_set(dst, src_ptr, (size_t)slot * per_slot, per_slot);
+        } else {
+            // Tier 3 (CPU mirror) → slot. Slow path; goes through scratch.
+            if (scratch_.size() < per_expert) scratch_.resize(per_expert);
+            ggml_backend_tensor_get(src, scratch_.data(), (size_t)expert * per_expert, per_expert);
+            ggml_backend_tensor_set(dst, scratch_.data(), (size_t)slot * per_slot, per_slot);
+        }
         return true;
     };
 
-    if (!copy_one(L.src_up,   L.up_slots))   return false;
-    if (!copy_one(L.src_gate, L.gate_slots)) return false;
-    if (!copy_one(L.src_down, L.down_slots)) return false;
+    if (!copy_one(L.src_up,   L.up_slots,   L.tier2_up_buf))   return false;
+    if (!copy_one(L.src_gate, L.gate_slots, L.tier2_gate_buf)) return false;
+    if (!copy_one(L.src_down, L.down_slots, L.tier2_down_buf)) return false;
+
+    if (t2 >= 0) total_pages_from_tier2_++;
 
     // Bookkeeping: evict whatever was here, install new expert.
     int32_t prev = L.slot_to_expert[slot];
@@ -478,6 +508,180 @@ int ModeBContext::refresh_slots() {
         }
     }
     return updates;
+}
+
+// ---- Commit #10: Tier 2 pinned host buffer ----
+
+bool ModeBContext::init_tier2(int n_tier2) {
+    if (!ctx_ || !backend_buffer_) {
+        std::fprintf(stderr, "[mode_b] init_tier2: ModeBContext not initialized\n");
+        return false;
+    }
+    if (n_tier2 <= 0 || n_tier2 > n_expert_) {
+        std::fprintf(stderr, "[mode_b] init_tier2: bad n_tier2=%d (n_expert=%d)\n",
+                     n_tier2, n_expert_);
+        return false;
+    }
+    if (n_tier2_ > 0) {
+        std::fprintf(stderr, "[mode_b] init_tier2: already initialized (n_tier2=%d)\n", n_tier2_);
+        return false;
+    }
+
+    n_tier2_ = n_tier2;
+    size_t total_pinned_bytes = 0;
+    int active_layers = 0;
+    for (size_t il = 0; il < layers_.size(); il++) {
+        auto & L = layers_[il];
+        if (!L.up_slots) continue;  // skipped (non-MoE) layer
+
+        // Sizes are derived from slot tensor metadata (per_slot_bytes).
+        const size_t up_bytes   = (size_t)n_tier2 * (ggml_nbytes(L.up_slots)   / (size_t)n_slot_);
+        const size_t down_bytes = (size_t)n_tier2 * (ggml_nbytes(L.down_slots) / (size_t)n_slot_);
+        const size_t gate_bytes = L.gate_slots
+            ? (size_t)n_tier2 * (ggml_nbytes(L.gate_slots) / (size_t)n_slot_)
+            : 0;
+
+        // 64-byte aligned for SIMD-friendly layout. cudaHostRegister wants
+        // page-aligned in practice but accepts arbitrary alignment.
+        auto alloc_pinned = [](size_t bytes) -> void * {
+            if (bytes == 0) return nullptr;
+            void * p = std::aligned_alloc(64, ((bytes + 63) / 64) * 64);
+            if (!p) return nullptr;
+            // Register with CUDA for page-locked DMA. Failure here is non-fatal
+            // — we'll just have a regular host buffer (still functions, just
+            // not pinned for fast PCIe).
+            if (!ggml_backend_cuda_register_host_buffer(p, bytes)) {
+                static bool warned = false;
+                if (!warned) {
+                    std::fprintf(stderr, "[mode_b] init_tier2: cuda host registration failed "
+                                         "(non-fatal — buffer remains unpinned)\n");
+                    warned = true;
+                }
+            }
+            return p;
+        };
+
+        L.tier2_up_buf   = alloc_pinned(up_bytes);
+        L.tier2_down_buf = alloc_pinned(down_bytes);
+        L.tier2_gate_buf = alloc_pinned(gate_bytes);
+
+        if (!L.tier2_up_buf || !L.tier2_down_buf || (gate_bytes > 0 && !L.tier2_gate_buf)) {
+            std::fprintf(stderr, "[mode_b] init_tier2: allocation failed at layer %zu "
+                                 "(needed up=%zu down=%zu gate=%zu)\n",
+                         il, up_bytes, down_bytes, gate_bytes);
+            n_tier2_ = 0;
+            return false;
+        }
+
+        L.tier2_to_expert.assign((size_t)n_tier2, -1);
+        L.expert_to_tier2.assign((size_t)n_expert_, -1);
+        L.tier2_next_write = 0;
+
+        // Seed Tier 2 with the slots' current contents (experts 0..n_slot-1
+        // populated at init). This means a "warm" Tier 2 already exists for
+        // those experts, so refresh_slots after first prompt picks them up
+        // via the fast path even before promote_to_tier2 is called.
+        for (int s = 0; s < n_slot_; s++) {
+            const int e = L.slot_to_expert[(size_t)s];
+            if (e < 0) continue;
+            // Tier 2 indexes 0..n_tier2-1; first n_slot entries mirror slots.
+            if (s >= n_tier2) break;
+            L.tier2_to_expert[(size_t)s] = e;
+            L.expert_to_tier2[(size_t)e] = s;
+            // Copy expert weights from CPU mirror into Tier 2 buffer
+            const size_t up_per   = ggml_nbytes(L.up_slots) / (size_t)n_slot_;
+            ggml_backend_tensor_get(L.src_up, (uint8_t *)L.tier2_up_buf + (size_t)s * up_per,
+                                    (size_t)e * up_per, up_per);
+            const size_t dn_per   = ggml_nbytes(L.down_slots) / (size_t)n_slot_;
+            ggml_backend_tensor_get(L.src_down, (uint8_t *)L.tier2_down_buf + (size_t)s * dn_per,
+                                    (size_t)e * dn_per, dn_per);
+            if (L.gate_slots && L.tier2_gate_buf) {
+                const size_t gp = ggml_nbytes(L.gate_slots) / (size_t)n_slot_;
+                ggml_backend_tensor_get(L.src_gate, (uint8_t *)L.tier2_gate_buf + (size_t)s * gp,
+                                        (size_t)e * gp, gp);
+            }
+        }
+        L.tier2_next_write = std::min(n_slot_, n_tier2);
+
+        total_pinned_bytes += up_bytes + down_bytes + gate_bytes;
+        active_layers++;
+    }
+
+    std::printf("[mode_b] Tier 2 active: n_tier2=%d, %d layers, %.2f GB pinned host RAM\n",
+                n_tier2, active_layers, total_pinned_bytes / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
+int ModeBContext::promote_to_tier2(int layer, const int32_t * experts, int count) {
+    if (n_tier2_ <= 0) return 0;
+    if (layer < 0 || layer >= (int)layers_.size()) return 0;
+    auto & L = layers_[layer];
+    if (!L.up_slots || !L.tier2_up_buf) return 0;
+
+    const size_t up_per   = ggml_nbytes(L.up_slots)   / (size_t)n_slot_;
+    const size_t dn_per   = ggml_nbytes(L.down_slots) / (size_t)n_slot_;
+    const size_t gt_per   = (L.gate_slots && L.tier2_gate_buf)
+        ? ggml_nbytes(L.gate_slots) / (size_t)n_slot_ : 0;
+
+    int new_promotions = 0;
+    for (int i = 0; i < count; i++) {
+        const int32_t e = experts[i];
+        if (e < 0 || e >= n_expert_) continue;
+        if (L.expert_to_tier2[(size_t)e] >= 0) continue;  // already there
+
+        // Pick a Tier 2 victim slot via round-robin write pointer. Doesn't
+        // evict experts that are CURRENTLY in Tier 1 (prefer to keep those
+        // hot in Tier 2 too — fast re-promote on miss). Walks at most n_tier2
+        // probes before giving up.
+        int t2_idx = -1;
+        for (int probe = 0; probe < n_tier2_; probe++) {
+            int candidate = L.tier2_next_write;
+            L.tier2_next_write = (L.tier2_next_write + 1) % n_tier2_;
+            const int32_t occupant = L.tier2_to_expert[(size_t)candidate];
+            // Skip if occupant is currently in Tier 1.
+            if (occupant >= 0 && L.expert_to_slot[(size_t)occupant] >= 0) continue;
+            t2_idx = candidate;
+            break;
+        }
+        if (t2_idx < 0) {
+            // All Tier 2 slots are also Tier 1 residents — pick any (round-robin
+            // landed back at start). This is an over-pinned regime; rare.
+            t2_idx = L.tier2_next_write;
+            L.tier2_next_write = (L.tier2_next_write + 1) % n_tier2_;
+        }
+
+        // Evict whatever was here.
+        int32_t prev = L.tier2_to_expert[(size_t)t2_idx];
+        if (prev >= 0) L.expert_to_tier2[(size_t)prev] = -1;
+
+        // Copy CPU mirror → Tier 2 pinned buffer.
+        ggml_backend_tensor_get(L.src_up,
+                                (uint8_t *)L.tier2_up_buf + (size_t)t2_idx * up_per,
+                                (size_t)e * up_per, up_per);
+        ggml_backend_tensor_get(L.src_down,
+                                (uint8_t *)L.tier2_down_buf + (size_t)t2_idx * dn_per,
+                                (size_t)e * dn_per, dn_per);
+        if (gt_per > 0) {
+            ggml_backend_tensor_get(L.src_gate,
+                                    (uint8_t *)L.tier2_gate_buf + (size_t)t2_idx * gt_per,
+                                    (size_t)e * gt_per, gt_per);
+        }
+
+        L.tier2_to_expert[(size_t)t2_idx] = e;
+        L.expert_to_tier2[(size_t)e] = t2_idx;
+        new_promotions++;
+        total_tier2_promotions_++;
+    }
+    return new_promotions;
+}
+
+int ModeBContext::tier2_index(int layer, int expert) const {
+    if (n_tier2_ <= 0) return -1;
+    if (layer < 0 || layer >= (int)layers_.size()) return -1;
+    if (expert < 0 || expert >= n_expert_) return -1;
+    const auto & L = layers_[layer];
+    if (L.expert_to_tier2.empty()) return -1;
+    return L.expert_to_tier2[(size_t)expert];
 }
 
 } // namespace moe_orch

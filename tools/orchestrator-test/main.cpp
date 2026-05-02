@@ -11,6 +11,7 @@
 
 #include "llama.h"
 
+#include "ggml.h"
 #include "ggml-backend.h"
 
 #include "orchestrator.h"
@@ -34,7 +35,9 @@ struct test_args {
     std::string predictor_path;
     std::string hopfield_path;       // --orchestrator-hopfield PATH (L2)
     int         l2_tier2_top_n = 32; // --l2-tier2-top-n N
+    int         tier2_size      = 0; // --tier2-size N (0 = disabled)
     bool        mode_b_graceful = false; // --mode-b-graceful: drop -INF mask
+    bool        warmup_prompt_centroid = false; // --warmup-prompt-centroid (opt-in; needs layer-0 Hopfield)
     int         n_predict        = 30;
     int         n_gpu_layers      = 99;
     int         n_threads         = 24;
@@ -82,6 +85,7 @@ static void print_usage(const char * prog) {
         "  --orchestrator-predictor PATH    .bin predictor file (Mode B: MLP + recency)\n"
         "  --orchestrator-hopfield PATH     L2 Hopfield predictor .bin (per-window prefetch)\n"
         "  --l2-tier2-top-n N               experts per layer Hopfield prefetches (default 32)\n"
+        "  --tier2-size N                   Mode B: pinned host Tier 2 capacity per layer (0 = off)\n"
         "  --mode-b-graceful                drop -INF mask (gate selects freely; pair with Hopfield)\n"
         "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
         "  --l1 N                           L1 (VRAM) cache capacity (per layer; total if --global-l1) (default 32)\n"
@@ -120,7 +124,10 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
                                                 a.hopfield_path = argv[++i];
         else if (arg == "--l2-tier2-top-n" && need("--l2-tier2-top-n"))
                                                 a.l2_tier2_top_n = std::atoi(argv[++i]);
+        else if (arg == "--tier2-size" && need("--tier2-size"))
+                                                a.tier2_size = std::atoi(argv[++i]);
         else if (arg == "--mode-b-graceful")    a.mode_b_graceful = true;
+        else if (arg == "--warmup-prompt-centroid") a.warmup_prompt_centroid = true;
         else if (arg == "--orchestrator-recency-only") a.orchestrator_recency_only = true;
         else if (arg == "--l1" && need("--l1")) a.l1_capacity = std::atoi(argv[++i]);
         else if (arg == "--l2" && need("--l2")) a.l2_capacity = std::atoi(argv[++i]);
@@ -147,6 +154,46 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else { std::fprintf(stderr, "unknown arg: %s\n", arg.c_str()); return false; }
     }
     if (a.model_path.empty()) { print_usage(argv[0]); return false; }
+    return true;
+}
+
+// Compute a hidden_dim-sized centroid by averaging token_embd rows for the
+// given token IDs. Handles quantized embedding tables via the ggml type
+// traits to_float helper.
+//
+// Returns true on success. Used for pre-prefill Hopfield warmup so the
+// cache is populated BEFORE the first llama_decode runs.
+static bool compute_prompt_centroid(llama_model * model,
+                                    const std::vector<llama_token> & tokens,
+                                    int32_t hidden_dim,
+                                    std::vector<float> & out_centroid) {
+    ggml_tensor * te = llama_model_get_tensor(model, "token_embd.weight");
+    if (!te) {
+        // Some archs use a different name (e.g., output.weight as input embed).
+        te = llama_model_get_tensor(model, "tok_embeddings.weight");
+    }
+    if (!te) return false;
+    if (te->ne[0] != (int64_t)hidden_dim) return false;
+
+    const auto * traits = ggml_get_type_traits(te->type);
+    if (!traits || !traits->to_float) return false;
+
+    const size_t row_bytes = ggml_row_size(te->type, te->ne[0]);
+    std::vector<uint8_t> raw(row_bytes);
+    std::vector<float>   row_f((size_t)hidden_dim);
+    out_centroid.assign((size_t)hidden_dim, 0.0f);
+
+    int32_t kept = 0;
+    for (llama_token t : tokens) {
+        if (t < 0 || (int64_t)t >= te->ne[1]) continue;
+        ggml_backend_tensor_get(te, raw.data(), (size_t)t * row_bytes, row_bytes);
+        traits->to_float(raw.data(), row_f.data(), (int64_t)hidden_dim);
+        for (int32_t i = 0; i < hidden_dim; i++) out_centroid[i] += row_f[i];
+        kept++;
+    }
+    if (kept == 0) return false;
+    const float inv = 1.0f / (float)kept;
+    for (int32_t i = 0; i < hidden_dim; i++) out_centroid[i] *= inv;
     return true;
 }
 
@@ -256,6 +303,11 @@ int main(int argc, char ** argv) {
             moe_orch::set_mode_b_context(mode_b_ctx.get());
             std::printf("[stage7] Mode B context active for graph build (graceful_mask=%s)\n",
                         args.mode_b_graceful ? "ON" : "OFF");
+            if (args.tier2_size > 0) {
+                if (!mode_b_ctx->init_tier2(args.tier2_size)) {
+                    std::fprintf(stderr, "[stage7] Tier 2 init FAILED — continuing without\n");
+                }
+            }
             // When Mode B is active, force orchestrator-recency-only so the
             // cb_eval bridge gets wired (we use it to observe routing for
             // Mode B's slot cache). Predictor still optional via the existing
@@ -362,6 +414,24 @@ int main(int argc, char ** argv) {
         lat.n_prompt_tokens = n_tok;
         lat.n_generated_tokens = 0;
         lat.per_token_ms.reserve(args.n_predict);
+
+        // ---- Pre-prefill Hopfield warmup (opt-in via --warmup-prompt-centroid) ----
+        // Computes prompt centroid from token_embd rows and runs Hopfield
+        // retrieval against it. Only useful when Hopfield was TRAINED on
+        // tok_embd-output space (early layer hidden states). For Hopfield
+        // trained on mid-network layer hidden states (e.g., layer 12 input),
+        // this warmup uses a different representation than the training keys
+        // and produces noisy retrieval — leave OFF in that case.
+        if (args.warmup_prompt_centroid && orchestrator && !args.hopfield_path.empty()) {
+            std::vector<float> centroid;
+            if (compute_prompt_centroid(model, tokens, hidden_dim, centroid)) {
+                orchestrator->warm_up_from_prompt_centroid(centroid.data());
+                if (mode_b_ctx) mode_b_ctx->refresh_slots();
+            } else {
+                std::fprintf(stderr, "[stage7] prompt-centroid warmup skipped "
+                                     "(token_embd not found or shape mismatch)\n");
+            }
+        }
 
         // ---- Prefill (= TTFT-dominant work) ----
         const auto t_prefill_start = std::chrono::steady_clock::now();
