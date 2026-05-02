@@ -479,7 +479,15 @@ extern "C" bool ggml_eval_callback_orchestrator(
         // Mode B: notify the slot cache of the routing decision so it can
         // mark experts dirty for the next refresh_slots() call.
         if (auto * mb = moe_orch::get_mode_b_context()) {
-            if (mb->active()) mb->on_routing(layer, host.data(), n_elements);
+            if (mb->active()) {
+                mb->on_routing(layer, host.data(), n_elements);
+                // Synchronous pre-MoE swap (graceful_mask only — no-op otherwise).
+                // Fixes mode collapse at small n_slot by ensuring every gate-
+                // selected expert IS in a slot before the FFN op consumes
+                // slot_map. Stream-ordered tensor_set guarantees the GPU sees
+                // updated slot_map before the next op reads it.
+                mb->on_gate_fired_sync(layer, host.data(), n_elements);
+            }
         }
         return true;
     }

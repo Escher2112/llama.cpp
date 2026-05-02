@@ -423,8 +423,13 @@ bool ModeBContext::_page_in_expert(int layer, int expert, int slot) {
     // page-locked DMA → measurably faster than from a random heap allocation.
     const int t2 = (n_tier2_ > 0) ? L.expert_to_tier2[(size_t)expert] : -1;
 
+    // For Tier 3 path we need separate scratch for each kind because the
+    // CUDA backend's tensor_set may queue cudaMemcpyAsync and return before
+    // the host->device DMA completes. Reusing one scratch across kinds
+    // would corrupt in-flight copies. Three separate buffers are cheap and
+    // correct without forcing a stream sync.
     auto copy_one = [&](ggml_tensor * src, ggml_tensor * dst,
-                        void * tier2_buf) -> bool {
+                        void * tier2_buf, std::vector<uint8_t> & local_scratch) -> bool {
         if (!src || !dst) return true;  // optional (e.g., gate)
         const size_t per_expert = ggml_nbytes(src) / (size_t)n_expert_;
         const size_t per_slot   = ggml_nbytes(dst) / (size_t)n_slot_;
@@ -436,16 +441,20 @@ bool ModeBContext::_page_in_expert(int layer, int expert, int slot) {
             ggml_backend_tensor_set(dst, src_ptr, (size_t)slot * per_slot, per_slot);
         } else {
             // Tier 3 (CPU mirror) → slot. Slow path; goes through scratch.
-            if (scratch_.size() < per_expert) scratch_.resize(per_expert);
-            ggml_backend_tensor_get(src, scratch_.data(), (size_t)expert * per_expert, per_expert);
-            ggml_backend_tensor_set(dst, scratch_.data(), (size_t)slot * per_slot, per_slot);
+            if (local_scratch.size() < per_expert) local_scratch.resize(per_expert);
+            ggml_backend_tensor_get(src, local_scratch.data(), (size_t)expert * per_expert, per_expert);
+            ggml_backend_tensor_set(dst, local_scratch.data(), (size_t)slot * per_slot, per_slot);
         }
         return true;
     };
 
-    if (!copy_one(L.src_up,   L.up_slots,   L.tier2_up_buf))   return false;
-    if (!copy_one(L.src_gate, L.gate_slots, L.tier2_gate_buf)) return false;
-    if (!copy_one(L.src_down, L.down_slots, L.tier2_down_buf)) return false;
+    // Three persistent scratch buffers, kept around across calls. They MUST
+    // remain valid until the tensor_set's cudaMemcpyAsync completes — which
+    // for our usage means until the slot_map tensor_set lands later in the
+    // stream (it forces a sync-equivalent barrier for the graph reads).
+    if (!copy_one(L.src_up,   L.up_slots,   L.tier2_up_buf,   scratch_up_))   return false;
+    if (!copy_one(L.src_gate, L.gate_slots, L.tier2_gate_buf, scratch_gate_)) return false;
+    if (!copy_one(L.src_down, L.down_slots, L.tier2_down_buf, scratch_down_)) return false;
 
     if (t2 >= 0) total_pages_from_tier2_++;
 
@@ -673,6 +682,105 @@ int ModeBContext::promote_to_tier2(int layer, const int32_t * experts, int count
         total_tier2_promotions_++;
     }
     return new_promotions;
+}
+
+int ModeBContext::on_gate_fired_sync(int layer, const int32_t * experts, int count) {
+    if (layer < 0 || layer >= (int)layers_.size()) return 0;
+    if (!graceful_mask_) return 0;  // no-op if hard mask is on; gate is constrained
+    auto & L = layers_[layer];
+    if (!L.up_slots) return 0;
+    if (count <= 0 || !experts) return 0;
+
+    // Build the unique set of selected experts for this batch.
+    // Small set in practice (top_k * n_tokens, capped by n_expert).
+    std::vector<int32_t> selected;
+    selected.reserve((size_t)count);
+    {
+        std::vector<bool> seen((size_t)n_expert_, false);
+        for (int i = 0; i < count; i++) {
+            const int32_t e = experts[i];
+            if (e < 0 || e >= n_expert_) continue;
+            if (!seen[(size_t)e]) {
+                seen[(size_t)e] = true;
+                selected.push_back(e);
+            }
+        }
+    }
+
+    // Identify misses (selected but not slot-resident).
+    std::vector<int32_t> misses;
+    misses.reserve(selected.size());
+    for (int32_t e : selected) {
+        if (L.expert_to_slot[(size_t)e] < 0) misses.push_back(e);
+    }
+    if (misses.empty()) return 0;
+
+    // Build the set of "evictable" slots: slots holding experts that are
+    // NOT in `selected`. These are safe to overwrite without breaking the
+    // current batch's FFN computation. If we can't find enough evictable
+    // slots to fit all misses, we evict the LRU residents we have to.
+    std::vector<bool> selected_mask((size_t)n_expert_, false);
+    for (int32_t e : selected) selected_mask[(size_t)e] = true;
+
+    std::vector<int32_t> safe_slots;
+    safe_slots.reserve((size_t)n_slot_);
+    for (int s = 0; s < n_slot_; s++) {
+        const int32_t occ = L.slot_to_expert[(size_t)s];
+        if (occ < 0 || !selected_mask[(size_t)occ]) safe_slots.push_back(s);
+    }
+
+    // If there aren't enough safe slots, fall back to LRU eviction (which
+    // can clobber currently-needed experts — degraded quality but at least
+    // forward progress). Walk lru from the back.
+    auto pick_lru_slot = [&]() -> int {
+        for (auto it = L.lru.rbegin(); it != L.lru.rend(); ++it) {
+            int32_t e = *it;
+            int32_t s = L.expert_to_slot[(size_t)e];
+            if (s >= 0) return s;
+        }
+        return 0;  // pathological fallback
+    };
+
+    int swaps = 0;
+    for (int32_t e : misses) {
+        int slot;
+        if (!safe_slots.empty()) {
+            slot = safe_slots.back();
+            safe_slots.pop_back();
+        } else {
+            slot = pick_lru_slot();
+        }
+        if (!_page_in_expert(layer, e, slot)) continue;
+        // Move e to MRU
+        for (auto it = L.lru.begin(); it != L.lru.end(); ++it) {
+            if (*it == e) { L.lru.erase(it); break; }
+        }
+        L.lru.insert(L.lru.begin(), e);
+        const size_t cap = (size_t)n_slot_ * 2;
+        if (L.lru.size() > cap) L.lru.resize(cap);
+        swaps++;
+    }
+    if (swaps == 0) return 0;
+
+    // Rebuild slot_map for this layer and push to GPU. The CUDA stream
+    // serializes this write before the next graph op (the get_rows that
+    // reads slot_map), so the FFN sees the updated mapping.
+    std::vector<int32_t> map_buf((size_t)n_expert_, 0);
+    std::vector<float>   mask_buf((size_t)n_expert_, 0.0f);  // graceful: all 0
+    for (int e = 0; e < n_expert_; e++) {
+        int32_t s = L.expert_to_slot[(size_t)e];
+        map_buf[(size_t)e] = (s >= 0) ? s : 0;
+    }
+    set_slot_map(layer, map_buf.data());
+    if (L.valid_mask) {
+        ggml_backend_tensor_set(L.valid_mask, mask_buf.data(),
+                                0, (size_t)n_expert_ * sizeof(float));
+    }
+    L.slot_map_dirty = false;
+
+    total_sync_swaps_ += (uint64_t)swaps;
+    total_pages_in_   += (uint64_t)swaps;
+    return swaps;
 }
 
 int ModeBContext::tier2_index(int layer, int expert) const {

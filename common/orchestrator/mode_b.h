@@ -209,6 +209,21 @@ public:
 
     uint64_t total_tier2_promotions() const { return total_tier2_promotions_; }
     uint64_t total_pages_from_tier2() const { return total_pages_from_tier2_; }
+    uint64_t total_sync_swaps()        const { return total_sync_swaps_; }
+
+    // ---- Commit #11: synchronous pre-MoE swap (graceful_mask quality fix) ----
+    //
+    // Called from the cb_eval bridge AFTER ffn_moe_topk-N's data is ready and
+    // BEFORE the MoE FFN op consumes slot_map. For each unique expert in
+    // `experts[count]` that isn't currently in a slot, this picks an
+    // eviction-safe slot (one whose current expert is NOT in the selected
+    // set), pages the missing expert in (Tier 2 fast path if available, else
+    // Tier 3 slow path), and updates slot_map so the FFN reads the new
+    // mapping. ggml_backend_tensor_set ordering on the CUDA stream guarantees
+    // these writes complete before the next op consumes the tensors.
+    //
+    // Returns the number of synchronous page-ins performed.
+    int on_gate_fired_sync(int layer, const int32_t * experts, int count);
 
     // Diagnostics
     uint64_t total_pages_in() const { return total_pages_in_; }
@@ -229,9 +244,16 @@ private:
     uint64_t total_evictions_ = 0;
     uint64_t total_tier2_promotions_ = 0;
     uint64_t total_pages_from_tier2_ = 0;
+    uint64_t total_sync_swaps_       = 0;
 
     // Scratch buffer reused across page-in operations to avoid allocations.
-    std::vector<uint8_t> scratch_;
+    // Three separate buffers (one per kind) so back-to-back tensor_get +
+    // tensor_set sequences don't collide on shared scratch in the unlikely
+    // case the CUDA backend's tensor_set returns before its DMA completes.
+    std::vector<uint8_t> scratch_;       // kept for backwards compat
+    std::vector<uint8_t> scratch_up_;
+    std::vector<uint8_t> scratch_gate_;
+    std::vector<uint8_t> scratch_down_;
 
     // Helpers
     bool _page_in_expert(int layer, int expert, int slot);

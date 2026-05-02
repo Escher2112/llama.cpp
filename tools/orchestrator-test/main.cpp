@@ -36,6 +36,7 @@ struct test_args {
     std::string hopfield_path;       // --orchestrator-hopfield PATH (L2)
     int         l2_tier2_top_n = 32; // --l2-tier2-top-n N
     int         tier2_size      = 0; // --tier2-size N (0 = disabled)
+    int         n_batch         = 512; // --n-batch N (smaller = better graceful-mask correctness on prefill)
     bool        mode_b_graceful = false; // --mode-b-graceful: drop -INF mask
     bool        warmup_prompt_centroid = false; // --warmup-prompt-centroid (opt-in; needs layer-0 Hopfield)
     int         n_predict        = 30;
@@ -128,6 +129,7 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
                                                 a.tier2_size = std::atoi(argv[++i]);
         else if (arg == "--mode-b-graceful")    a.mode_b_graceful = true;
         else if (arg == "--warmup-prompt-centroid") a.warmup_prompt_centroid = true;
+        else if (arg == "--n-batch" && need("--n-batch")) a.n_batch = std::atoi(argv[++i]);
         else if (arg == "--orchestrator-recency-only") a.orchestrator_recency_only = true;
         else if (arg == "--l1" && need("--l1")) a.l1_capacity = std::atoi(argv[++i]);
         else if (arg == "--l2" && need("--l2")) a.l2_capacity = std::atoi(argv[++i]);
@@ -370,7 +372,7 @@ int main(int argc, char ** argv) {
     // ---- Phase 3: build context with cb_eval wired ----
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx       = args.ctx_size;
-    cparams.n_batch     = 512;
+    cparams.n_batch     = args.n_batch;
     cparams.n_threads   = args.n_threads;
     cparams.n_threads_batch = args.n_threads;
     if (orchestrator) {
@@ -434,12 +436,34 @@ int main(int argc, char ** argv) {
         }
 
         // ---- Prefill (= TTFT-dominant work) ----
+        //
+        // Graceful-mask Mode B requires n_slot > max(unique_experts_per_batch).
+        // For top_k=8 and n_slot=32, that means each batch must have <= ~3
+        // tokens so the union (top_k * B) leaves a safety margin. We chunk
+        // the prompt accordingly. With graceful_mask OFF (hard mask, default),
+        // the hard mask forces unique_experts <= n_slot regardless, so we can
+        // process the full prompt in one batch.
         const auto t_prefill_start = std::chrono::steady_clock::now();
-        if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tok))) {
-            std::fprintf(stderr, "prefill failed\n"); return false;
+        int chunk_size = n_tok;
+        if (args.mode_b_graceful && mode_b_ctx) {
+            // For graceful_mask correctness: at most n_slot/2/top_k tokens per
+            // batch so that selected (chunk*top_k) fits in HALF the slots,
+            // leaving the other half as safe evict targets when sync-swap
+            // fires. top_k for qwen3 is 8 (configured in graph); we use 8 as
+            // a conservative default. n_batch caps from above.
+            const int top_k = 8;
+            const int safe_per_batch = std::max(1, args.l1_capacity / (2 * top_k));
+            chunk_size = std::min(chunk_size, safe_per_batch);
+            chunk_size = std::min(chunk_size, args.n_batch);
         }
-        // Mode B: refresh slots based on what experts the prefill observed.
-        if (mode_b_ctx) mode_b_ctx->refresh_slots();
+        for (int pos = 0; pos < n_tok; pos += chunk_size) {
+            const int len = std::min(chunk_size, n_tok - pos);
+            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + pos, len))) {
+                std::fprintf(stderr, "prefill failed at pos=%d len=%d\n", pos, len);
+                return false;
+            }
+            if (mode_b_ctx) mode_b_ctx->refresh_slots();
+        }
         const auto t_prefill_end = std::chrono::steady_clock::now();
         lat.prefill_decode_ms =
             std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
