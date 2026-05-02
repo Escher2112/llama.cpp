@@ -54,6 +54,16 @@ struct test_args {
     // ffn_*_exps), e.g. "5,0" zeros the FIRST expert of layer 5.
     // Empty/unset = no mutation.
     std::string spike_mutate;
+    // Stage 7 mode selection. Determines where expert weights physically live.
+    //   "auto"     — pick at runtime (commit #3 will implement detection;
+    //                until then, defaults to "slot" behavior).
+    //   "resident" — experts loaded to CUDA buffer (VRAM). Mode A.
+    //                Requires VRAM >= expert footprint. For DGX Spark / H100 /
+    //                M1 Max-class hardware. Equivalent to --no-override-exps.
+    //   "slot"     — experts pinned to CPU buffer; orchestrator's tiered
+    //                cache manages a VRAM subset. Mode B. Required on
+    //                consumer GPUs where total expert footprint exceeds VRAM.
+    std::string orchestrator_mode = "auto";
 };
 
 static void print_usage(const char * prog) {
@@ -76,7 +86,11 @@ static void print_usage(const char * prog) {
         "                                   (X in (0,1]; default disabled = skip-if-resident)\n"
         "  --dump-trace PATH                write per-(layer, token) trace to PATH (binary)\n"
         "  --prompts-file PATH              run a list of prompts (one per line) sequentially\n"
-        "  --no-override-exps               do NOT pin experts to CPU (default: do pin)\n",
+        "  --no-override-exps               do NOT pin experts to CPU (default: do pin)\n"
+        "  --orchestrator-mode MODE         live-mode strategy: auto | resident | slot (default auto)\n"
+        "                                   resident = experts in VRAM (Mode A; needs big VRAM)\n"
+        "                                   slot     = experts on CPU, orchestrator manages VRAM cache\n"
+        "                                   auto     = pick at runtime (today: behaves as slot)\n",
         prog);
 }
 
@@ -105,6 +119,13 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
                                                 a.l2_promote_threshold = (float)std::atof(argv[++i]);
         else if (arg == "--spike-mutate" && need("--spike-mutate"))
                                                 a.spike_mutate = argv[++i];
+        else if (arg == "--orchestrator-mode" && need("--orchestrator-mode")) {
+            a.orchestrator_mode = argv[++i];
+            if (a.orchestrator_mode != "auto" && a.orchestrator_mode != "resident" && a.orchestrator_mode != "slot") {
+                std::fprintf(stderr, "invalid --orchestrator-mode (must be auto|resident|slot)\n");
+                return false;
+            }
+        }
         else if (arg == "--dump-trace" && need("--dump-trace"))
                                                 a.dump_trace_path = argv[++i];
         else if (arg == "--prompts-file" && need("--prompts-file"))
@@ -138,6 +159,23 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     // ---- Phase 1: load model ----
+    // Stage 7 mode selection: resident = experts to VRAM, slot = experts on CPU.
+    // "auto" today means slot (commit #3 will add VRAM detection). Resident mode
+    // overrides --no-override-exps to off (don't pin to CPU); slot mode overrides
+    // it on (do pin, current default behavior).
+    if (args.orchestrator_mode == "resident") {
+        if (args.override_exps_cpu) {
+            std::printf("[stage7] mode=resident: experts will load to GPU buffer (overriding default CPU pin)\n");
+        }
+        args.override_exps_cpu = false;
+    } else if (args.orchestrator_mode == "slot") {
+        args.override_exps_cpu = true;
+    }
+    // mode == "auto": leave override_exps_cpu at its current value (default true).
+    std::printf("[stage7] orchestrator-mode=%s  experts on %s\n",
+                args.orchestrator_mode.c_str(),
+                args.override_exps_cpu ? "CPU (slot-managed)" : "GPU (resident)");
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = args.n_gpu_layers;
     // Spike test mutates expert tensors via ggml_backend_tensor_set, which
