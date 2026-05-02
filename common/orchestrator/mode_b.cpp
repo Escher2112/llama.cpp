@@ -48,6 +48,12 @@ bool ModeBContext::init(const llama_model * model,
     }
 
     layers_.resize((size_t)n_layer);
+    for (int il = 0; il < n_layer; il++) {
+        layers_[il].slot_to_expert.assign((size_t)n_slot, -1);
+        layers_[il].expert_to_slot.assign((size_t)n_expert, -1);
+        layers_[il].lru.reserve((size_t)n_slot * 2);
+        layers_[il].dirty.reserve((size_t)n_slot);
+    }
 
     // Per-layer: locate the model's expert tensors by name, allocate matching
     // slot tensors with the same shape/quant pattern but n_slot in the expert
@@ -157,6 +163,19 @@ bool ModeBContext::init(const llama_model * model,
         if (!copy_first_n_slot(up_t,   layers_[il].up_slots,   "up"))   return false;
         if (!copy_first_n_slot(gate_t, layers_[il].gate_slots, "gate")) return false;
         if (!copy_first_n_slot(down_t, layers_[il].down_slots, "down")) return false;
+
+        // Cache the source tensor pointers for runtime page-in, and mark the
+        // initial slot occupancy (slots 0..n_slot-1 hold experts 0..n_slot-1).
+        layers_[il].src_up   = up_t;
+        layers_[il].src_gate = gate_t;
+        layers_[il].src_down = down_t;
+        for (int s = 0; s < n_slot; s++) {
+            if (s < n_expert) {
+                layers_[il].slot_to_expert[s] = s;
+                layers_[il].expert_to_slot[s] = s;
+                layers_[il].lru.push_back(s);  // MRU first; doesn't matter for init
+            }
+        }
     }
 
     // Initial slot_map: experts 0..n_slot-1 → slots 0..n_slot-1 (identity);
@@ -258,6 +277,141 @@ size_t ModeBContext::slot_size_bytes(int layer, int kind) const {
     }
     if (!t || n_slot_ == 0) return 0;
     return ggml_nbytes(t) / (size_t)n_slot_;
+}
+
+// ---- Commit #6: runtime LRU + page-on-miss ----
+
+void ModeBContext::attach_model(const llama_model * model) {
+    if (!model) return;
+    for (size_t il = 0; il < layers_.size(); il++) {
+        if (!layers_[il].up_slots) continue;
+        // Re-fetch (init already did this but stash for safety/idempotence)
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "blk.%zu.ffn_up_exps.weight",   il);
+        layers_[il].src_up   = llama_model_get_tensor(model, nm);
+        std::snprintf(nm, sizeof(nm), "blk.%zu.ffn_gate_exps.weight", il);
+        layers_[il].src_gate = llama_model_get_tensor(model, nm);
+        std::snprintf(nm, sizeof(nm), "blk.%zu.ffn_down_exps.weight", il);
+        layers_[il].src_down = llama_model_get_tensor(model, nm);
+    }
+}
+
+void ModeBContext::on_routing(int layer, const int32_t * experts, int count) {
+    if (layer < 0 || layer >= (int)layers_.size()) return;
+    auto & L = layers_[layer];
+    if (!L.up_slots) return;  // skipped (non-MoE) layer
+    for (int i = 0; i < count; i++) {
+        const int32_t e = experts[i];
+        if (e < 0 || e >= n_expert_) continue;
+
+        // Move e to MRU position in lru list.
+        bool found = false;
+        for (auto it = L.lru.begin(); it != L.lru.end(); ++it) {
+            if (*it == e) { L.lru.erase(it); found = true; break; }
+        }
+        L.lru.insert(L.lru.begin(), e);
+        // Cap lru size to avoid unbounded growth — keep at most 2*n_slot
+        // entries (provides a small "warm tail" beyond the resident set).
+        const size_t cap = (size_t)n_slot_ * 2;
+        if (L.lru.size() > cap) L.lru.resize(cap);
+
+        // If this expert isn't currently in slots, mark dirty for refresh.
+        if (L.expert_to_slot[e] < 0) {
+            // Already in dirty queue?
+            bool in_dirty = false;
+            for (int32_t d : L.dirty) {
+                if (d == e) { in_dirty = true; break; }
+            }
+            if (!in_dirty) L.dirty.push_back(e);
+            L.slot_map_dirty = true;
+        }
+        (void)found;
+    }
+}
+
+int ModeBContext::_pick_eviction_slot(int layer) {
+    auto & L = layers_[layer];
+    // Walk lru from LRU end (back) and find the first entry currently
+    // occupying a slot — that's the LRU resident expert. Evict it.
+    for (auto it = L.lru.rbegin(); it != L.lru.rend(); ++it) {
+        int32_t e = *it;
+        int32_t s = L.expert_to_slot[e];
+        if (s >= 0) {
+            return s;
+        }
+    }
+    // Fallback: slot 0 (shouldn't happen in steady state)
+    return 0;
+}
+
+bool ModeBContext::_page_in_expert(int layer, int expert, int slot) {
+    auto & L = layers_[layer];
+    if (slot < 0 || slot >= n_slot_) return false;
+
+    auto copy_one = [&](ggml_tensor * src, ggml_tensor * dst) -> bool {
+        if (!src || !dst) return true;  // optional (e.g., gate)
+        const size_t per_expert = ggml_nbytes(src) / (size_t)n_expert_;
+        const size_t per_slot   = ggml_nbytes(dst) / (size_t)n_slot_;
+        if (per_expert != per_slot) return false;
+        if (scratch_.size() < per_expert) scratch_.resize(per_expert);
+        ggml_backend_tensor_get(src, scratch_.data(), (size_t)expert * per_expert, per_expert);
+        ggml_backend_tensor_set(dst, scratch_.data(), (size_t)slot * per_slot, per_slot);
+        return true;
+    };
+
+    if (!copy_one(L.src_up,   L.up_slots))   return false;
+    if (!copy_one(L.src_gate, L.gate_slots)) return false;
+    if (!copy_one(L.src_down, L.down_slots)) return false;
+
+    // Bookkeeping: evict whatever was here, install new expert.
+    int32_t prev = L.slot_to_expert[slot];
+    if (prev >= 0) {
+        L.expert_to_slot[prev] = -1;
+        total_evictions_++;
+    }
+    L.slot_to_expert[slot] = expert;
+    L.expert_to_slot[expert] = slot;
+    total_pages_in_++;
+    return true;
+}
+
+int ModeBContext::refresh_slots() {
+    int updates = 0;
+    std::vector<int32_t> map_buf;
+    map_buf.resize((size_t)n_expert_);
+
+    for (size_t il = 0; il < layers_.size(); il++) {
+        auto & L = layers_[il];
+        if (!L.up_slots) continue;
+
+        // Page in any dirty experts. For each, pick a victim slot via LRU
+        // among currently-resident experts (not in dirty).
+        for (int32_t e : L.dirty) {
+            // Skip if it's already cached (could have been paged in by
+            // another expert that shares the slot — defensive).
+            if (L.expert_to_slot[e] >= 0) continue;
+            const int slot = _pick_eviction_slot((int)il);
+            if (!_page_in_expert((int)il, e, slot)) {
+                // Failure — log once and continue with other dirty experts
+                std::fprintf(stderr, "[mode_b] page_in failed: layer=%zu expert=%d slot=%d\n",
+                             il, e, slot);
+                continue;
+            }
+            updates++;
+        }
+        L.dirty.clear();
+
+        // If the slot occupancy changed, rebuild slot_map for this layer.
+        if (L.slot_map_dirty || updates > 0) {
+            for (int e = 0; e < n_expert_; e++) {
+                int32_t s = L.expert_to_slot[e];
+                map_buf[(size_t)e] = (s >= 0) ? s : 0;  // sentinel: slot 0 (commit #6 fallback)
+            }
+            set_slot_map((int)il, map_buf.data());
+            L.slot_map_dirty = false;
+        }
+    }
+    return updates;
 }
 
 } // namespace moe_orch

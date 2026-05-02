@@ -35,6 +35,29 @@ struct ModeBLayer {
     ggml_tensor * gate_slots = nullptr;     // [n_ff, n_embd, n_slot] (or nullptr if model is fused)
     ggml_tensor * down_slots = nullptr;     // [n_embd, n_ff, n_slot]
     ggml_tensor * slot_map   = nullptr;     // [n_expert] of int32 slot indices
+
+    // Runtime cache state. Mirrors the slot tensor occupancy on the CPU
+    // side so we can compute the diff between desired and current contents.
+    std::vector<int32_t> slot_to_expert;    // size n_slot; slot K holds expert slot_to_expert[K], or -1
+    std::vector<int32_t> expert_to_slot;    // size n_expert; expert E in slot expert_to_slot[E], or -1
+
+    // Pointers into the source model's full-size expert tensors. Used as
+    // CPU mirror for paging in via tensor_get + tensor_set. Set by
+    // attach_model() after init.
+    ggml_tensor * src_up   = nullptr;
+    ggml_tensor * src_gate = nullptr;
+    ggml_tensor * src_down = nullptr;
+
+    // LRU usage order. MRU at front. Capacity bounded only by the number
+    // of distinct experts ever observed; refresh_slots() keeps top-n_slot
+    // resident.
+    std::vector<int32_t> lru;               // MRU at index 0
+
+    // Pending: experts that should be paged in but aren't yet. Filled by
+    // on_routing(); drained by refresh_slots(). Avoids unbounded growth
+    // by deduping against lru.
+    std::vector<int32_t> dirty;
+    bool                 slot_map_dirty = false;
 };
 
 class ModeBContext {
@@ -97,6 +120,33 @@ public:
     // for callers preparing host-side copies to page in.
     size_t slot_size_bytes(int layer, int kind) const;
 
+    // ---- Runtime cache management (commit #6) ----
+
+    // Provide pointers to the source model's full-size expert tensors.
+    // Used by the runtime LRU path to page experts from the CPU mirror
+    // (where the loaded model's experts live with --cpu-moe) into slots.
+    // Called once after init() with the same llama_model passed there.
+    void attach_model(const llama_model * model);
+
+    // Observation: the gate at `layer` selected `experts[count]`. Updates
+    // the per-layer LRU. Called from the cb_eval bridge when ffn_moe_topk-N
+    // fires.
+    void on_routing(int layer, const int32_t * experts, int count);
+
+    // Apply queued cache decisions: any experts that the LRU has marked
+    // "should be in slots" but currently aren't get paged in (CPU mirror
+    // → slot via tensor_get/tensor_set). Updates slot_map to reflect new
+    // slot occupancy. Synchronous for commit #6 — async pipelining is a
+    // commit #7+ optimization.
+    //
+    // Should be called between forward passes (after each llama_decode).
+    // Returns the number of slot updates made (for diagnostics).
+    int refresh_slots();
+
+    // Diagnostics
+    uint64_t total_pages_in() const { return total_pages_in_; }
+    uint64_t total_evictions() const { return total_evictions_; }
+
 private:
     int n_slot_   = 0;
     int n_expert_ = 0;
@@ -104,6 +154,17 @@ private:
     ggml_context *           ctx_            = nullptr;
     ggml_backend_buffer_t    backend_buffer_ = nullptr;
     std::vector<ModeBLayer>  layers_;
+
+    // Counters for diagnostics
+    uint64_t total_pages_in_  = 0;
+    uint64_t total_evictions_ = 0;
+
+    // Scratch buffer reused across page-in operations to avoid allocations.
+    std::vector<uint8_t> scratch_;
+
+    // Helpers
+    bool _page_in_expert(int layer, int expert, int slot);
+    int  _pick_eviction_slot(int layer);
 };
 
 // Global singleton. Set by orchestrator-test (or other host) before model

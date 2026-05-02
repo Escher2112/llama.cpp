@@ -12,6 +12,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "mode_b.h"
+
 namespace moe_orch {
 
 Orchestrator::Orchestrator(const OrchestratorConfig &  config,
@@ -356,6 +358,11 @@ extern "C" bool ggml_eval_callback_orchestrator(
         // Trace: stash per-token shape.
         if (orch->is_trace_enabled()) {
             orch->trace_stash_indices_batch(layer, host.data(), n_tokens, top_k);
+        }
+        // Mode B: notify the slot cache of the routing decision so it can
+        // mark experts dirty for the next refresh_slots() call.
+        if (auto * mb = moe_orch::get_mode_b_context()) {
+            if (mb->active()) mb->on_routing(layer, host.data(), n_elements);
         }
         return true;
     }

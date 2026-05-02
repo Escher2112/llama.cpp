@@ -228,16 +228,25 @@ int main(int argc, char ** argv) {
     // The full Mode B path lights up in commit #5 + #6.
     std::unique_ptr<moe_orch::ModeBContext> mode_b_ctx;
     if (args.orchestrator_mode == "slot" || args.orchestrator_mode == "auto") {
-        // Default n_slot for v0.1 prototype on 16 GB consumer GPUs. Tuned in
-        // commit #7 once we have wall-clock numbers.
-        const int n_slot_default = 8;
+        // Mode B's n_slot reuses the existing --l1 capacity flag for natural
+        // continuity with the shadow-mode sweeps (Phases 5/6). Default 32.
+        const int n_slot = args.l1_capacity;
         mode_b_ctx = std::make_unique<moe_orch::ModeBContext>();
-        if (!mode_b_ctx->init(model, n_layers, n_experts, n_slot_default, /*device_id=*/0)) {
+        if (!mode_b_ctx->init(model, n_layers, n_experts, n_slot, /*device_id=*/0)) {
             std::fprintf(stderr, "[stage7] ModeBContext init FAILED — falling back to no Mode B\n");
             mode_b_ctx.reset();
         } else {
+            mode_b_ctx->attach_model(model);
             moe_orch::set_mode_b_context(mode_b_ctx.get());
             std::printf("[stage7] Mode B context active for graph build\n");
+            // When Mode B is active, force orchestrator-recency-only so the
+            // cb_eval bridge gets wired (we use it to observe routing for
+            // Mode B's slot cache). Predictor still optional via the existing
+            // --orchestrator-predictor flag for warm-up acceleration.
+            if (args.predictor_path.empty() && !args.orchestrator_recency_only) {
+                args.orchestrator_recency_only = true;
+                std::printf("[stage7]   (auto-enabled --orchestrator-recency-only for cb_eval observation)\n");
+            }
         }
     }
 
@@ -337,6 +346,8 @@ int main(int argc, char ** argv) {
         if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tok))) {
             std::fprintf(stderr, "prefill failed\n"); return false;
         }
+        // Mode B: refresh slots based on what experts the prefill observed.
+        if (mode_b_ctx) mode_b_ctx->refresh_slots();
         const auto t_prefill_end = std::chrono::steady_clock::now();
         lat.prefill_decode_ms =
             std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
@@ -374,6 +385,10 @@ int main(int argc, char ** argv) {
             if (llama_decode(ctx, llama_batch_get_one(&best, 1))) {
                 std::fprintf(stderr, "decode step %d failed\n", i); return false;
             }
+            // Mode B: refresh slots between tokens. This is the crux of
+            // commit #6 — page in any newly-seen experts that the slot
+            // cache wants but doesn't yet have.
+            if (mode_b_ctx) mode_b_ctx->refresh_slots();
 
             const auto t_iter_end = std::chrono::steady_clock::now();
             if (i > 0) {
