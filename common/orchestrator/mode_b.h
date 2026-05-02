@@ -133,6 +133,18 @@ public:
     // fires.
     void on_routing(int layer, const int32_t * experts, int count);
 
+    // Predictor hint: a learned predictor expects experts[count] will be
+    // wanted at `layer` in the near future (typically next forward pass
+    // for that layer). Marks those experts as dirty for inclusion in the
+    // next refresh_slots() call. Called from Orchestrator::on_layer_input
+    // alongside cache_.prefetch_to_l1, so mode_b's slot pool and the
+    // shadow-mode tiered cache stay aligned.
+    //
+    // Predictor predictions help BEFORE the gate fires (preemptive
+    // page-in), where on_routing only helps AFTER (reactive). With both
+    // wired, cache coverage converges much faster.
+    void mark_predicted(int layer, const int32_t * experts, int count);
+
     // Apply queued cache decisions: any experts that the LRU has marked
     // "should be in slots" but currently aren't get paged in (CPU mirror
     // → slot via tensor_get/tensor_set). Updates slot_map to reflect new

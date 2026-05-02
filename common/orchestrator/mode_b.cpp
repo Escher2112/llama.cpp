@@ -329,6 +329,36 @@ void ModeBContext::on_routing(int layer, const int32_t * experts, int count) {
     }
 }
 
+void ModeBContext::mark_predicted(int layer, const int32_t * experts, int count) {
+    if (layer < 0 || layer >= (int)layers_.size()) return;
+    auto & L = layers_[layer];
+    if (!L.up_slots) return;  // skipped layer
+    for (int i = 0; i < count; i++) {
+        const int32_t e = experts[i];
+        if (e < 0 || e >= n_expert_) continue;
+        // Move to MRU position so refresh_slots prefers keeping it.
+        // (Same logic as on_routing — predicted-and-not-yet-used acts like
+        // a soft "I expect this soon.")
+        bool found = false;
+        for (auto it = L.lru.begin(); it != L.lru.end(); ++it) {
+            if (*it == e) { L.lru.erase(it); found = true; break; }
+        }
+        L.lru.insert(L.lru.begin(), e);
+        const size_t cap = (size_t)n_slot_ * 2;
+        if (L.lru.size() > cap) L.lru.resize(cap);
+
+        if (L.expert_to_slot[e] < 0) {
+            bool in_dirty = false;
+            for (int32_t d : L.dirty) {
+                if (d == e) { in_dirty = true; break; }
+            }
+            if (!in_dirty) L.dirty.push_back(e);
+            L.slot_map_dirty = true;
+        }
+        (void)found;
+    }
+}
+
 int ModeBContext::_pick_eviction_slot(int layer) {
     auto & L = layers_[layer];
     // Walk lru from LRU end (back) and find the first entry currently

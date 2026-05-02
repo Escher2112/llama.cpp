@@ -125,6 +125,20 @@ void Orchestrator::on_layer_input(int32_t layer, const float * hidden_state) {
                                   scratch_top_.data(),
                                   config_.l1_prefetch_top_k,
                                   want_conf ? scratch_conf_.data() : nullptr);
+            // Mode B: feed the predictor's prediction into the slot cache's
+            // dirty queue too. This is the predictive page-ahead path —
+            // experts the predictor expects the gate to pick get marked
+            // dirty BEFORE the gate fires, so refresh_slots between forward
+            // passes pages them in pre-emptively. Without this, the slot
+            // cache is purely reactive (page-on-miss), which corrupts the
+            // first use of every newly-needed expert.
+            if (auto * mb = moe_orch::get_mode_b_context()) {
+                if (mb->active()) {
+                    mb->mark_predicted(target_layer,
+                                       scratch_top_.data(),
+                                       config_.l1_prefetch_top_k);
+                }
+            }
         }
     }
 }
