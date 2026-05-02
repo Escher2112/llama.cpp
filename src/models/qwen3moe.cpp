@@ -1,5 +1,9 @@
 #include "models.h"
 
+#ifdef LLAMA_ORCHESTRATOR_BUILD
+#include "../../common/orchestrator/mode_b.h"
+#endif
+
 llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -72,6 +76,28 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // Mode B (slot-mapped) live-mode integration. When the orchestrator's
+        // ModeBContext singleton is active, fetch the per-layer slot_map tensor
+        // and pass it to build_moe_ffn. The slot_map remaps gate-selected
+        // expert IDs ([0, n_expert)) to slot IDs ([0, n_slot)) before they
+        // index into the expert weight tensors.
+        //
+        // Commit #4 scope: pass slot_map only. Slot weight tensors (smaller
+        // per-layer expert tensors) are added in commit #5 — until then the
+        // model's full-size expert tensors are still used, with the slot_map
+        // initialized to identity (slot_map[e] = e for e in [0, n_slot),
+        // others = 0). This makes the path a no-op behaviorally while
+        // exercising the new code; commit #5 substitutes real slot tensors
+        // and changes slot_map to actually compress the expert space.
+        ggml_tensor * mb_slot_map = nullptr;
+#ifdef LLAMA_ORCHESTRATOR_BUILD
+        if (auto * mb = moe_orch::get_mode_b_context()) {
+            if (mb->active()) {
+                mb_slot_map = mb->slot_map(il);
+            }
+        }
+#endif
+
         ggml_tensor * moe_out =
             build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
@@ -87,7 +113,8 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     nullptr, nullptr,
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    mb_slot_map);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

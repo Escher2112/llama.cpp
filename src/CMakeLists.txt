@@ -53,6 +53,17 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+# Optional moe-orchestrator integration. When LLAMA_ORCHESTRATOR=ON, the
+# orchestrator's mode_b singleton is reachable from per-arch model files
+# (qwen3moe.cpp, deepseek3.cpp) for live-mode slot-mapped expert handling.
+# The symbol is defined in libmoe_orchestrator.a; arch files guard the
+# call site with #ifdef LLAMA_ORCHESTRATOR_BUILD.
+if (LLAMA_ORCHESTRATOR)
+    target_link_libraries(llama PRIVATE moe_orchestrator)
+    target_include_directories(llama PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(llama PRIVATE LLAMA_ORCHESTRATOR_BUILD)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

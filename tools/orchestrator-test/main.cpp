@@ -15,6 +15,7 @@
 
 #include "orchestrator.h"
 #include "predictor.h"
+#include "mode_b.h"
 
 #include <algorithm>
 #include <chrono>
@@ -217,6 +218,28 @@ int main(int argc, char ** argv) {
     const int32_t n_experts  = read_n_experts_from_model(model);
     std::printf("Model dims: n_layers=%d, hidden_dim=%d, n_experts=%d\n",
                 n_layers, hidden_dim, n_experts);
+
+    // ---- Phase 1.5: Mode B context (slot-mapped live mode) ----
+    // Initialize the singleton ModeBContext so qwen3moe.cpp's graph builder
+    // sees an active slot_map at graph build time. For commit #4 the slot
+    // weight tensors aren't allocated yet (commit #5 follows), so the
+    // slot_map defaults to identity (slot_map[e] = e for e in [0, n_slot),
+    // others = 0), which is a no-op behaviorally — same outputs as baseline.
+    // The full Mode B path lights up in commit #5 + #6.
+    std::unique_ptr<moe_orch::ModeBContext> mode_b_ctx;
+    if (args.orchestrator_mode == "slot" || args.orchestrator_mode == "auto") {
+        // Default n_slot for v0.1 prototype on 16 GB consumer GPUs. Tuned in
+        // commit #7 once we have wall-clock numbers.
+        const int n_slot_default = 8;
+        mode_b_ctx = std::make_unique<moe_orch::ModeBContext>();
+        if (!mode_b_ctx->init(n_layers, n_slot_default, n_experts, /*device_id=*/0)) {
+            std::fprintf(stderr, "[stage7] ModeBContext init FAILED — falling back to no Mode B\n");
+            mode_b_ctx.reset();
+        } else {
+            moe_orch::set_mode_b_context(mode_b_ctx.get());
+            std::printf("[stage7] Mode B context active for graph build\n");
+        }
+    }
 
     // ---- Phase 2: build orchestrator (if requested) ----
     std::unique_ptr<moe_orch::Orchestrator> orchestrator;
@@ -561,6 +584,9 @@ int main(int argc, char ** argv) {
         std::printf("Tokens: %d prompt-tokens total / %d generated total\n",
                     total_prompt, total_gen);
     }
+
+    moe_orch::set_mode_b_context(nullptr);
+    mode_b_ctx.reset();
 
     llama_free(ctx);
     llama_model_free(model);

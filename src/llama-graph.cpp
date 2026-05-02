@@ -1465,13 +1465,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // contents via ggml_backend_tensor_set between forward passes based
     // on its predictor + tiered cache decisions.
     //
-    // selected_experts shape: [n_expert_used, n_tokens]
-    // slot_map shape: [n_expert]
-    // ggml_get_rows of a 1D source tensor with 2D index tensor yields a
-    // tensor of the index tensor's shape with looked-up values — exactly
-    // what we need. No-op when slot_map is null.
+    // ggml_get_rows requires the source's axis 2 to match the indices'
+    // axis 1 (the n_tokens batch dim). slot_map is shared across all
+    // tokens in the batch, so we reshape and repeat it across the batch.
+    //
+    // slot_map      shape: [n_expert]                     of I32
+    // selected_experts shape: [n_expert_used, n_tokens]   of I32
+    // After repeat:  smap shape [1, n_expert, n_tokens, 1] of I32
+    // ggml_get_rows result: [1, n_expert_used, n_tokens, 1] of I32
+    // After reshape: [n_expert_used, n_tokens] of I32 — same shape as input.
     if (slot_map != nullptr) {
-        selected_experts = ggml_get_rows(ctx0, slot_map, selected_experts);
+        ggml_tensor * smap_b = ggml_reshape_3d(ctx0, slot_map, 1, n_expert, 1);
+        smap_b = ggml_repeat_4d(ctx0, smap_b, 1, n_expert, n_tokens, 1);
+        ggml_tensor * remapped = ggml_get_rows(ctx0, smap_b, selected_experts);
+        // remapped shape is [1, n_expert_used, n_tokens, 1]; reshape to 2D.
+        selected_experts = ggml_reshape_2d(ctx0, remapped, n_expert_used, n_tokens);
         cb(selected_experts, "ffn_moe_topk_slotmapped", il);
     }
 

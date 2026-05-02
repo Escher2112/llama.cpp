@@ -193,6 +193,13 @@ endif()
 # build the library
 #
 
+# Orchestrator is added BEFORE src so the libllama target can link against
+# moe_orchestrator when LLAMA_ORCHESTRATOR=ON. This lets per-arch graph
+# builders (qwen3moe.cpp etc.) reach into the Mode B slot-mapped context.
+if (LLAMA_ORCHESTRATOR)
+    add_subdirectory(common/orchestrator)
+endif()
+
 add_subdirectory(src)
 
 #
@@ -202,10 +209,6 @@ add_subdirectory(src)
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
     add_subdirectory(vendor/cpp-httplib)
-endif()
-
-if (LLAMA_ORCHESTRATOR)
-    add_subdirectory(common/orchestrator)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
