@@ -6,9 +6,11 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "llama.h"
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace moe_orch {
 
@@ -19,29 +21,11 @@ static ModeBContext * g_ctx = nullptr;
 ModeBContext * get_mode_b_context()                        { return g_ctx; }
 void           set_mode_b_context(ModeBContext * ctx)      { g_ctx = ctx;  }
 
-// For commit #4 we punt on the actual quantization-aware tensor allocation
-// and instead allocate F16 slot tensors at init. The model's expert tensors
-// are typically quantized (Q3_K_M, Q4_K_M, Q8_0). Real Mode B will need to
-// allocate slot tensors with matching quantization to avoid format conversion
-// on every page-in. That's commit #5 — for now we get the plumbing in place
-// and ship the simpler F16 path. Rationale: the goal of #4 is "Mode B end-
-// to-end compiles, runs, exposes the path." Quant-matching is an
-// optimization on top.
-//
-// The dimensions here are placeholders; they'll be filled from model hparams
-// once we wire orchestrator-test to call init() with the right values.
-// For now we accept them as parameters and trust the caller.
-//
-// init() does NOT need n_ff or n_embd because we accept them implicitly: at
-// init time we only allocate slot_map tensors (small, [n_expert] int32 each).
-// The slot weight tensors require knowing n_ff/n_embd — caller must use the
-// upcoming populate_layer() API to attach those once the model is loaded.
-// Keeping init lean lets it run before model load.
-
-bool ModeBContext::init(int n_layer, int n_slot, int n_expert, int device_id) {
-    if (n_layer <= 0 || n_slot <= 0 || n_expert <= 0) {
-        std::fprintf(stderr, "[mode_b] init: invalid params (n_layer=%d n_slot=%d n_expert=%d)\n",
-                     n_layer, n_slot, n_expert);
+bool ModeBContext::init(const llama_model * model,
+                        int n_layer, int n_expert, int n_slot, int device_id) {
+    if (!model || n_layer <= 0 || n_slot <= 0 || n_expert <= 0) {
+        std::fprintf(stderr, "[mode_b] init: invalid params (model=%p n_layer=%d n_slot=%d n_expert=%d)\n",
+                     (const void *)model, n_layer, n_slot, n_expert);
         return false;
     }
 
@@ -49,10 +33,10 @@ bool ModeBContext::init(int n_layer, int n_slot, int n_expert, int device_id) {
     n_expert_  = n_expert;
     device_id_ = device_id;
 
-    // ggml_context with no_alloc; we'll use a backend buffer for the data.
-    // Estimate tensor count: per layer we have 1 slot_map (commit #4 scope —
-    // weight slot tensors come in commit #5). Plus a small overhead.
-    const size_t n_tensors = (size_t)n_layer + 8; // +slack
+    // ggml_context with no_alloc; we'll use a single CUDA backend buffer for
+    // the data. Tensor count: per layer we have up_slots + gate_slots +
+    // down_slots + slot_map = 4. Plus slack.
+    const size_t n_tensors = (size_t)n_layer * 4 + 8;
     struct ggml_init_params iparams = {};
     iparams.mem_size   = ggml_tensor_overhead() * n_tensors;
     iparams.mem_buffer = nullptr;
@@ -64,24 +48,59 @@ bool ModeBContext::init(int n_layer, int n_slot, int n_expert, int device_id) {
     }
 
     layers_.resize((size_t)n_layer);
+
+    // Per-layer: locate the model's expert tensors by name, allocate matching
+    // slot tensors with the same shape/quant pattern but n_slot in the expert
+    // dim. Each model expert tensor has shape [a, b, n_expert] (where a,b are
+    // arch-specific); we replace the third dim with n_slot.
+    //
+    // Names follow llama.cpp convention: blk.<L>.ffn_<kind>_exps.weight where
+    // kind ∈ {up, gate, down}. Some MoE archs may have nullptr gate (fused
+    // gate_up); we tolerate that by leaving gate_slots nullptr.
+    size_t total_slot_bytes = 0;
     for (int il = 0; il < n_layer; il++) {
-        char name[64];
-        std::snprintf(name, sizeof(name), "moe_orch.slot_map.layer_%d", il);
-        ggml_tensor * smap = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_expert);
-        if (!smap) {
-            std::fprintf(stderr, "[mode_b] init: tensor alloc failed at layer %d\n", il);
-            ggml_free(ctx_); ctx_ = nullptr;
-            return false;
+        char nm[64];
+        auto get_or = [&](const char * kind) -> ggml_tensor * {
+            std::snprintf(nm, sizeof(nm), "blk.%d.ffn_%s_exps.weight", il, kind);
+            return llama_model_get_tensor(model, nm);
+        };
+        ggml_tensor * up_t   = get_or("up");
+        ggml_tensor * gate_t = get_or("gate");
+        ggml_tensor * down_t = get_or("down");
+
+        if (!up_t || !down_t) {
+            // Not a MoE layer (e.g., dense layers in hybrid arches), skip.
+            // slot_map stays null too — qwen3moe.cpp will see null and fall
+            // back to model tensors / no remap.
+            continue;
         }
-        ggml_set_name(smap, name);
-        layers_[il].slot_map = smap;
-        // Weight slot tensors (up_slots, gate_slots, down_slots) are NOT
-        // allocated in commit #4 — added in commit #5 once we have model
-        // hparams for n_ff and n_embd. For now layers_[il].*_slots stay null.
+
+        // Allocate slot tensors matching the model's quant + spatial dims,
+        // with n_slot in the expert dim (third axis). The model expert
+        // tensors have shape ne[0]=a, ne[1]=b, ne[2]=n_expert.
+        layers_[il].up_slots   = ggml_new_tensor_3d(ctx_, up_t->type,   up_t->ne[0],   up_t->ne[1],   n_slot);
+        layers_[il].down_slots = ggml_new_tensor_3d(ctx_, down_t->type, down_t->ne[0], down_t->ne[1], n_slot);
+        if (gate_t) {
+            layers_[il].gate_slots = ggml_new_tensor_3d(ctx_, gate_t->type, gate_t->ne[0], gate_t->ne[1], n_slot);
+        }
+        layers_[il].slot_map = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_expert);
+
+        // Set debug names for traceability in graph dumps.
+        char dbg[64];
+        std::snprintf(dbg, sizeof(dbg), "moe_orch.up_slots.layer_%d",   il); ggml_set_name(layers_[il].up_slots, dbg);
+        std::snprintf(dbg, sizeof(dbg), "moe_orch.down_slots.layer_%d", il); ggml_set_name(layers_[il].down_slots, dbg);
+        if (layers_[il].gate_slots) {
+            std::snprintf(dbg, sizeof(dbg), "moe_orch.gate_slots.layer_%d", il); ggml_set_name(layers_[il].gate_slots, dbg);
+        }
+        std::snprintf(dbg, sizeof(dbg), "moe_orch.slot_map.layer_%d", il); ggml_set_name(layers_[il].slot_map, dbg);
+
+        total_slot_bytes += ggml_nbytes(layers_[il].up_slots);
+        total_slot_bytes += ggml_nbytes(layers_[il].down_slots);
+        if (layers_[il].gate_slots) total_slot_bytes += ggml_nbytes(layers_[il].gate_slots);
+        total_slot_bytes += ggml_nbytes(layers_[il].slot_map);
     }
 
-    // Allocate backend buffer on the requested CUDA device. This binds the
-    // tensor data pointers to VRAM addresses on that device.
+    // Allocate the single backend buffer covering all tensors in ctx_.
     ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device_id);
     if (!buft) {
         std::fprintf(stderr, "[mode_b] init: ggml_backend_cuda_buffer_type(%d) returned null\n", device_id);
@@ -90,37 +109,79 @@ bool ModeBContext::init(int n_layer, int n_slot, int n_expert, int device_id) {
     }
     backend_buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft);
     if (!backend_buffer_) {
-        std::fprintf(stderr, "[mode_b] init: backend buffer allocation failed (likely OOM)\n");
+        std::fprintf(stderr, "[mode_b] init: backend buffer allocation failed (likely OOM, "
+                             "needed %.2f GB VRAM)\n",
+                     total_slot_bytes / (1024.0 * 1024.0 * 1024.0));
         ggml_free(ctx_); ctx_ = nullptr;
         return false;
     }
 
     std::printf("[mode_b] context initialized: n_layer=%d n_slot=%d n_expert=%d device=%d\n",
                 n_layer, n_slot, n_expert, device_id);
-    std::printf("[mode_b]   slot_map tensors allocated (%d × %d int32 = %d bytes total)\n",
-                n_layer, n_expert, n_layer * n_expert * 4);
-    std::printf("[mode_b]   weight slot tensors deferred to commit #5 (need model hparams)\n");
+    std::printf("[mode_b]   total slot tensor bytes: %.2f GB\n",
+                total_slot_bytes / (1024.0 * 1024.0 * 1024.0));
 
-    // Initialize slot_map to FULL identity (slot_map[e] = e for all e in
-    // [0, n_expert)). This makes the slot_map remap a behavioral no-op:
-    // the gate's selected_experts gets remapped to itself, then used to
-    // index into the model's full-size expert tensors as before. Result is
-    // identical output to baseline.
-    //
-    // In commit #5+ this gets replaced with the actual mapping (slot_map[e]
-    // = slot_id for cached experts, sentinel for un-cached) once the smaller
-    // per-layer slot weight tensors are allocated and the orchestrator
-    // populates them from its cache decisions.
-    std::vector<int32_t> initial_map(n_expert);
-    for (int e = 0; e < n_expert; e++) {
+    // Initial population: copy first n_slot experts' weights from the model's
+    // full-size expert tensors into our slot tensors. Each expert occupies
+    // (total_bytes_of_model_tensor / n_expert) bytes. Use ggml_backend_tensor_get
+    // to extract from the model's CPU buffer, then ggml_backend_tensor_set to
+    // write into our CUDA backend buffer.
+    std::vector<uint8_t> scratch;
+    auto copy_first_n_slot = [&](ggml_tensor * src, ggml_tensor * dst, const char * label) -> bool {
+        if (!src || !dst) return true;  // skipped layer
+        const size_t src_per_expert = ggml_nbytes(src) / (size_t)n_expert;
+        const size_t dst_per_slot   = ggml_nbytes(dst) / (size_t)n_slot;
+        if (src_per_expert != dst_per_slot) {
+            std::fprintf(stderr, "[mode_b] init: %s per-expert size mismatch "
+                                 "(src=%zu dst=%zu) — quant/dim layout differs?\n",
+                         label, src_per_expert, dst_per_slot);
+            return false;
+        }
+        if (scratch.size() < src_per_expert) scratch.resize(src_per_expert);
+        for (int s = 0; s < n_slot; s++) {
+            ggml_backend_tensor_get(src, scratch.data(), (size_t)s * src_per_expert, src_per_expert);
+            ggml_backend_tensor_set(dst, scratch.data(), (size_t)s * dst_per_slot, dst_per_slot);
+        }
+        return true;
+    };
+    for (int il = 0; il < n_layer; il++) {
+        if (!layers_[il].up_slots) continue; // skipped layer
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_up_exps.weight", il);
+        ggml_tensor * up_t = llama_model_get_tensor(model, nm);
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_exps.weight", il);
+        ggml_tensor * gate_t = llama_model_get_tensor(model, nm);
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
+        ggml_tensor * down_t = llama_model_get_tensor(model, nm);
+
+        if (!copy_first_n_slot(up_t,   layers_[il].up_slots,   "up"))   return false;
+        if (!copy_first_n_slot(gate_t, layers_[il].gate_slots, "gate")) return false;
+        if (!copy_first_n_slot(down_t, layers_[il].down_slots, "down")) return false;
+    }
+
+    // Initial slot_map: experts 0..n_slot-1 → slots 0..n_slot-1 (identity);
+    // experts n_slot..n_expert-1 → slot 0 (sentinel — they read slot 0's
+    // weights, which is "wrong but bounded" output. commit #6 adds a real
+    // page-on-miss path). The orchestrator's predictor will update this
+    // dynamically in commit #6 to reflect actual cache contents.
+    std::vector<int32_t> initial_map(n_expert, 0);
+    for (int e = 0; e < n_expert && e < n_slot; e++) {
         initial_map[e] = e;
     }
     for (int il = 0; il < n_layer; il++) {
+        if (!layers_[il].slot_map) continue;
         if (!set_slot_map(il, initial_map.data())) {
             std::fprintf(stderr, "[mode_b] init: set_slot_map failed at layer %d\n", il);
             return false;
         }
     }
+
+    int active_layers = 0;
+    for (auto & l : layers_) if (l.up_slots) active_layers++;
+    std::printf("[mode_b]   populated %d MoE layers with first %d experts each\n",
+                active_layers, n_slot);
+    std::printf("[mode_b]   slot_map: experts [0,%d) → slots [0,%d), experts [%d,%d) → slot 0 (sentinel)\n",
+                n_slot, n_slot, n_slot, n_expert);
 
     return true;
 }

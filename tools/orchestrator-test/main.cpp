@@ -232,7 +232,7 @@ int main(int argc, char ** argv) {
         // commit #7 once we have wall-clock numbers.
         const int n_slot_default = 8;
         mode_b_ctx = std::make_unique<moe_orch::ModeBContext>();
-        if (!mode_b_ctx->init(n_layers, n_slot_default, n_experts, /*device_id=*/0)) {
+        if (!mode_b_ctx->init(model, n_layers, n_experts, n_slot_default, /*device_id=*/0)) {
             std::fprintf(stderr, "[stage7] ModeBContext init FAILED — falling back to no Mode B\n");
             mode_b_ctx.reset();
         } else {

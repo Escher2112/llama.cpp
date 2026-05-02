@@ -77,23 +77,26 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         cb(cur, "ffn_norm", il);
 
         // Mode B (slot-mapped) live-mode integration. When the orchestrator's
-        // ModeBContext singleton is active, fetch the per-layer slot_map tensor
-        // and pass it to build_moe_ffn. The slot_map remaps gate-selected
-        // expert IDs ([0, n_expert)) to slot IDs ([0, n_slot)) before they
-        // index into the expert weight tensors.
+        // ModeBContext singleton is active AND has populated slot weight
+        // tensors for this layer, substitute the smaller slot tensors for
+        // the model's full-size expert tensors AND pass the slot_map for
+        // gate-index → slot-index remap.
         //
-        // Commit #4 scope: pass slot_map only. Slot weight tensors (smaller
-        // per-layer expert tensors) are added in commit #5 — until then the
-        // model's full-size expert tensors are still used, with the slot_map
-        // initialized to identity (slot_map[e] = e for e in [0, n_slot),
-        // others = 0). This makes the path a no-op behaviorally while
-        // exercising the new code; commit #5 substitutes real slot tensors
-        // and changes slot_map to actually compress the expert space.
+        // When mb is active but slot weights are nullptr (e.g., dense layers
+        // skipped during init, or pre-commit-#5 state), fall through to
+        // baseline tensors — the slot_map alone with model tensors is also
+        // a valid configuration (was the commit #4 state).
+        ggml_tensor * up_use   = model.layers[il].ffn_up_exps;
+        ggml_tensor * gate_use = model.layers[il].ffn_gate_exps;
+        ggml_tensor * down_use = model.layers[il].ffn_down_exps;
         ggml_tensor * mb_slot_map = nullptr;
 #ifdef LLAMA_ORCHESTRATOR_BUILD
         if (auto * mb = moe_orch::get_mode_b_context()) {
             if (mb->active()) {
                 mb_slot_map = mb->slot_map(il);
+                if (mb->up_slots(il))   up_use   = mb->up_slots(il);
+                if (mb->gate_slots(il)) gate_use = mb->gate_slots(il);
+                if (mb->down_slots(il)) down_use = mb->down_slots(il);
             }
         }
 #endif
@@ -101,9 +104,9 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         ggml_tensor * moe_out =
             build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
+                    up_use,
+                    gate_use,
+                    down_use,
                     nullptr,
                     n_expert, n_expert_used,
                     LLM_FFN_SILU, true,

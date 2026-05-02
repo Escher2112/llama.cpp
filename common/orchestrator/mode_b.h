@@ -24,6 +24,7 @@
 struct ggml_tensor;
 struct ggml_context;
 struct ggml_backend_buffer;
+struct llama_model;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
 namespace moe_orch {
@@ -39,10 +40,28 @@ struct ModeBLayer {
 class ModeBContext {
 public:
     // Initialize for a model with n_layer MoE layers.
-    // n_slot: number of expert slots per layer (typical: 4-32 on consumer GPUs).
-    // device_id: CUDA device ordinal.
-    // Returns false if allocation or backend buffer creation fails.
-    bool init(int n_layer, int n_slot, int n_expert, int device_id);
+    //   model      — the loaded llama_model. Used to query per-layer expert
+    //                tensor shapes/quant types so slot tensors are allocated
+    //                with matching layout (required for the matmul kernels
+    //                to accept them as drop-in substitutes).
+    //   n_layer    — number of MoE layers in the model (caller computes).
+    //   n_expert   — experts per layer (caller computes from model metadata).
+    //   n_slot     — VRAM-resident slot count per layer. Typical 4-32 on
+    //                consumer GPUs.
+    //   device_id  — CUDA device ordinal.
+    //
+    // Allocates per-layer slot weight tensors (up_slots, gate_slots if model
+    // has separate gate, down_slots), per-layer slot_map tensors, plus a
+    // single CUDA backend buffer covering all of the above. Then populates
+    // each slot with the corresponding model expert's weights (slot k holds
+    // expert k for k in [0, n_slot)) and initializes slot_map to map
+    // experts 0..n_slot-1 to slots 0..n_slot-1, mapping experts beyond
+    // n_slot-1 to slot 0 as a sentinel (commit #5 simplification — commit #6
+    // adds proper page-on-miss handling for unmapped experts).
+    //
+    // Returns false on any allocation, copy, or model-tensor-lookup failure.
+    bool init(const llama_model * model,
+              int n_layer, int n_expert, int n_slot, int device_id);
 
     // Clean up: free backend buffer and ggml context.
     ~ModeBContext();

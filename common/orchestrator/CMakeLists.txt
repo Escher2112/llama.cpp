@@ -11,6 +11,7 @@ add_library(moe_orchestrator STATIC
 
 target_include_directories(moe_orchestrator
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/include
 )
 
 # We need C++17 for structured bindings + fold expressions in our code.
