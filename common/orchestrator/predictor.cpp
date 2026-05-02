@@ -266,7 +266,8 @@ bool MLPPredictor::predict_top_k(
     int32_t horizon,
     const float * hidden_state,
     int32_t top_k,
-    int32_t * out_indices) const
+    int32_t * out_indices,
+    float * out_confidences) const
 {
     int32_t hi = head_index(source_layer, horizon);
     if (hi < 0) return false;
@@ -321,6 +322,26 @@ bool MLPPredictor::predict_top_k(
     std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
                       [](const auto & a, const auto & b) { return a.first > b.first; });
     for (int32_t i = 0; i < k; i++) out_indices[i] = ranked[i].second;
+
+    // Optional softmax confidence return.
+    // Numerically stable softmax over all n_experts_ logits, then index out
+    // the k selected. Cost ~n_experts_ exp() + 1 normalization — cheap on
+    // top of the GEMMs above.
+    if (out_confidences) {
+        float maxv = -INFINITY;
+        for (uint32_t i = 0; i < n_experts_; i++) {
+            if (logits[i] > maxv) maxv = logits[i];
+        }
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_experts_; i++) {
+            logits[i] = std::exp(logits[i] - maxv);
+            sum += logits[i];
+        }
+        const float inv = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
+        for (int32_t i = 0; i < k; i++) {
+            out_confidences[i] = logits[ranked[i].second] * inv;
+        }
+    }
     return true;
 }
 

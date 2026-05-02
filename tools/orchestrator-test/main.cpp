@@ -17,6 +17,7 @@
 #include "predictor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +44,8 @@ struct test_args {
     int         l1_capacity                = 32;
     int         l2_capacity                = 80;
     int         prefetch_top_k             = 16;
+    bool        global_l1                  = false;
+    float       l2_promote_threshold       = -1.0f;   // < 0 = disabled
     std::string dump_trace_path;          // --dump-trace PATH
     std::string prompts_file;             // --prompts-file PATH (1 prompt per line)
 };
@@ -58,9 +61,13 @@ static void print_usage(const char * prog) {
         "  -c N                             context size (default 4096)\n"
         "  --orchestrator-predictor PATH    .bin predictor file (Mode B: MLP + recency)\n"
         "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
-        "  --l1 N                           L1 (VRAM) cache capacity per layer (default 32)\n"
+        "  --l1 N                           L1 (VRAM) cache capacity (per layer; total if --global-l1) (default 32)\n"
         "  --l2 N                           L2 (RAM)  cache capacity per layer (default 80)\n"
         "  --prefetch-top-k N               experts the MLP prefetches per call (default 16)\n"
+        "  --global-l1                      L1 is a global pool of slots across all layers\n"
+        "                                   (live-mode physical-VRAM model; --l1 = total slots)\n"
+        "  --l2-promote-threshold X         enable L2->L1 promotion when predictor confidence >= X\n"
+        "                                   (X in (0,1]; default disabled = skip-if-resident)\n"
         "  --dump-trace PATH                write per-(layer, token) trace to PATH (binary)\n"
         "  --prompts-file PATH              run a list of prompts (one per line) sequentially\n"
         "  --no-override-exps               do NOT pin experts to CPU (default: do pin)\n",
@@ -87,6 +94,9 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "--l2" && need("--l2")) a.l2_capacity = std::atoi(argv[++i]);
         else if (arg == "--prefetch-top-k" && need("--prefetch-top-k"))
                                                 a.prefetch_top_k = std::atoi(argv[++i]);
+        else if (arg == "--global-l1")          a.global_l1 = true;
+        else if (arg == "--l2-promote-threshold" && need("--l2-promote-threshold"))
+                                                a.l2_promote_threshold = (float)std::atof(argv[++i]);
         else if (arg == "--dump-trace" && need("--dump-trace"))
                                                 a.dump_trace_path = argv[++i];
         else if (arg == "--prompts-file" && need("--prompts-file"))
@@ -159,6 +169,8 @@ int main(int argc, char ** argv) {
         cfg.l1_capacity = args.l1_capacity;
         cfg.l2_capacity = args.l2_capacity;
         cfg.l1_prefetch_top_k = args.prefetch_top_k;
+        cfg.global_l1 = args.global_l1;
+        cfg.l2_promote_threshold = args.l2_promote_threshold;
         cfg.dump_trace_path = args.dump_trace_path;
         orchestrator = std::make_unique<moe_orch::Orchestrator>(
             cfg, args.predictor_path, /*hopfield=*/"",
@@ -170,8 +182,14 @@ int main(int argc, char ** argv) {
                 ? "MODE A (recency-only)"
                 : "MODE B (recency + MLP predictor)";
         }
-        std::printf("Orchestrator: %s  l1=%d  l2=%d\n",
-                    mode_label, args.l1_capacity, args.l2_capacity);
+        std::printf("Orchestrator: %s  l1=%d%s  l2=%d%s\n",
+                    mode_label,
+                    args.l1_capacity, args.global_l1 ? " (global)" : "/layer",
+                    args.l2_capacity,
+                    args.l2_promote_threshold >= 0.0f ? "  l2->l1 gated" : "");
+        if (args.l2_promote_threshold >= 0.0f) {
+            std::printf("  l2->l1 promote threshold: %.3f\n", args.l2_promote_threshold);
+        }
         if (!args.predictor_path.empty()) {
             std::printf("  predictor: %s\n", args.predictor_path.c_str());
         }
@@ -201,6 +219,19 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
+    // Per-prompt latency record. Captured for each prompt and aggregated at end.
+    struct PromptLatency {
+        int    n_prompt_tokens;
+        int    n_generated_tokens;
+        double ttft_ms;                 // prefill llama_decode + argmax for first token
+        double prefill_decode_ms;       // just the prefill llama_decode (no argmax/sampling)
+        double generation_total_ms;     // from after first token to end of generation
+        double steady_state_tok_per_s;  // (n_generated - 1) / generation_total
+        std::vector<double> per_token_ms; // post-first-token decode latencies (size = n_generated - 1)
+    };
+    std::vector<PromptLatency> latencies;
+    latencies.reserve(64);
+
     auto run_one_prompt = [&](const std::string & prompt) -> bool {
         std::vector<llama_token> tokens(prompt.size() + 16);
         int n_tok = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
@@ -211,11 +242,30 @@ int main(int argc, char ** argv) {
 
         std::printf(">>> [%d toks in] ", n_tok);
         std::fflush(stdout);
+
+        PromptLatency lat;
+        lat.n_prompt_tokens = n_tok;
+        lat.n_generated_tokens = 0;
+        lat.per_token_ms.reserve(args.n_predict);
+
+        // ---- Prefill (= TTFT-dominant work) ----
+        const auto t_prefill_start = std::chrono::steady_clock::now();
         if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tok))) {
             std::fprintf(stderr, "prefill failed\n"); return false;
         }
+        const auto t_prefill_end = std::chrono::steady_clock::now();
+        lat.prefill_decode_ms =
+            std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+
+        // ---- Generation loop ----
+        // First-iteration timing: prefill_end → first_token_picked ⇒ TTFT.
+        // Subsequent iterations: each timed individually for steady-state percentiles.
+        std::chrono::steady_clock::time_point t_first_token = t_prefill_end;  // updated below
+        std::chrono::steady_clock::time_point t_gen_start;                    // = t_first_token
 
         for (int i = 0; i < args.n_predict; i++) {
+            const auto t_iter_start = std::chrono::steady_clock::now();
+
             const float * logits = llama_get_logits_ith(ctx, -1);
             int n_vocab = llama_vocab_n_tokens(vocab);
             llama_token best = 0;
@@ -229,11 +279,42 @@ int main(int argc, char ** argv) {
             int n = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, true);
             if (n > 0) { std::fwrite(piece, 1, n, stdout); std::fflush(stdout); }
 
+            if (i == 0) {
+                // After argmax + emit of the first token = TTFT moment.
+                t_first_token = std::chrono::steady_clock::now();
+                t_gen_start   = t_first_token;
+                lat.ttft_ms = std::chrono::duration<double, std::milli>(
+                    t_first_token - t_prefill_start).count();
+            }
+
             if (llama_decode(ctx, llama_batch_get_one(&best, 1))) {
                 std::fprintf(stderr, "decode step %d failed\n", i); return false;
             }
+
+            const auto t_iter_end = std::chrono::steady_clock::now();
+            if (i > 0) {
+                // Steady-state token: time from end of previous iter to end of this iter
+                // includes argmax, emit, and decode. That's what the user perceives as
+                // "time per token after the first one."
+                lat.per_token_ms.push_back(std::chrono::duration<double, std::milli>(
+                    t_iter_end - t_iter_start).count());
+            }
+            lat.n_generated_tokens++;
         }
+        const auto t_gen_end = std::chrono::steady_clock::now();
+        lat.generation_total_ms = std::chrono::duration<double, std::milli>(
+            t_gen_end - t_gen_start).count();
+        lat.steady_state_tok_per_s = (lat.n_generated_tokens > 1)
+            ? ((double)(lat.n_generated_tokens - 1) / (lat.generation_total_ms / 1000.0))
+            : 0.0;
+
         std::printf("\n<<<\n");
+        std::printf("    [latency] TTFT=%.0fms  steady=%.2f tok/s  gen=%d toks  prefill=%.0fms  prompt=%d toks\n",
+                    lat.ttft_ms, lat.steady_state_tok_per_s,
+                    lat.n_generated_tokens, lat.prefill_decode_ms, lat.n_prompt_tokens);
+        std::fflush(stdout);
+
+        latencies.push_back(std::move(lat));
         return true;
     };
 
@@ -331,6 +412,52 @@ int main(int argc, char ** argv) {
                             (unsigned long long)std::get<3>(rows[i]));
             }
         }
+    }
+
+    // ---- Aggregate per-prompt latency report (TTFT + steady-state) ----
+    if (!latencies.empty()) {
+        auto pct = [](std::vector<double> v, double p) -> double {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            const double idx = p * (v.size() - 1);
+            const size_t lo = (size_t)idx;
+            const size_t hi = std::min(lo + 1, v.size() - 1);
+            const double frac = idx - (double)lo;
+            return v[lo] * (1.0 - frac) + v[hi] * frac;
+        };
+
+        std::vector<double> ttft_ms, prefill_ms, ss_tok_per_s;
+        std::vector<double> all_per_token_ms;
+        int total_gen = 0, total_prompt = 0;
+        for (const auto & lat : latencies) {
+            ttft_ms.push_back(lat.ttft_ms);
+            prefill_ms.push_back(lat.prefill_decode_ms);
+            if (lat.steady_state_tok_per_s > 0) ss_tok_per_s.push_back(lat.steady_state_tok_per_s);
+            for (double t : lat.per_token_ms) all_per_token_ms.push_back(t);
+            total_gen    += lat.n_generated_tokens;
+            total_prompt += lat.n_prompt_tokens;
+        }
+
+        std::printf("\n=== Latency aggregate (%zu prompts) ===\n", latencies.size());
+        std::printf("TTFT (s):           p50=%.2f  p90=%.2f  p99=%.2f  min=%.2f  max=%.2f\n",
+                    pct(ttft_ms, 0.50)/1000.0, pct(ttft_ms, 0.90)/1000.0,
+                    pct(ttft_ms, 0.99)/1000.0,
+                    *std::min_element(ttft_ms.begin(), ttft_ms.end())/1000.0,
+                    *std::max_element(ttft_ms.begin(), ttft_ms.end())/1000.0);
+        std::printf("Prefill decode (s): p50=%.2f  p90=%.2f  p99=%.2f\n",
+                    pct(prefill_ms, 0.50)/1000.0, pct(prefill_ms, 0.90)/1000.0,
+                    pct(prefill_ms, 0.99)/1000.0);
+        std::printf("Steady-state tok/s: p50=%.2f  p90=%.2f  p10=%.2f  best=%.2f  worst=%.2f\n",
+                    pct(ss_tok_per_s, 0.50), pct(ss_tok_per_s, 0.90), pct(ss_tok_per_s, 0.10),
+                    ss_tok_per_s.empty() ? 0.0 : *std::max_element(ss_tok_per_s.begin(), ss_tok_per_s.end()),
+                    ss_tok_per_s.empty() ? 0.0 : *std::min_element(ss_tok_per_s.begin(), ss_tok_per_s.end()));
+        if (!all_per_token_ms.empty()) {
+            std::printf("Per-token decode (ms): p50=%.1f  p90=%.1f  p99=%.1f  (n=%zu samples)\n",
+                        pct(all_per_token_ms, 0.50), pct(all_per_token_ms, 0.90),
+                        pct(all_per_token_ms, 0.99), all_per_token_ms.size());
+        }
+        std::printf("Tokens: %d prompt-tokens total / %d generated total\n",
+                    total_prompt, total_gen);
     }
 
     llama_free(ctx);

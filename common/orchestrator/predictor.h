@@ -65,15 +65,21 @@ public:
 
     // Predict the top-K experts at (source_layer + horizon) given the input
     // hidden state at source_layer.
-    //   hidden_state: float pointer of length hidden_dim_
-    //   out_indices : caller-provided int32 buffer of length top_k
+    //   hidden_state    : float pointer of length hidden_dim_
+    //   out_indices     : caller-provided int32 buffer of length top_k
+    //   out_confidences : OPTIONAL caller-provided float buffer of length top_k.
+    //                     When non-null, filled with softmax(logits)[top_k_indices]
+    //                     in the same order as out_indices. These are the predictor's
+    //                     confidence in each named expert (sum across all 128 = 1.0).
+    //                     Used by cache.prefetch_to_l1 to gate L2->L1 promotion.
     // Returns false if no head exists for the requested (source_layer, horizon).
     bool predict_top_k(
         int32_t source_layer,
         int32_t horizon,
         const float * hidden_state,
         int32_t top_k,
-        int32_t * out_indices) const;
+        int32_t * out_indices,
+        float * out_confidences = nullptr) const;
 
     uint32_t hidden_dim()    const { return hidden_dim_; }
     uint32_t hidden_units()  const { return hidden_units_; }

@@ -62,11 +62,19 @@ class ThreeTierCache {
 public:
     // Per-layer capacities (in number of expert slots, not bytes).
     // n_layers and n_experts_per_layer come from the model config.
+    //
+    // global_l1: when true, L1 is a single global LRU pool of (layer,expert)
+    // entries with total capacity = l1_capacity (NOT l1_capacity per layer).
+    // Eviction picks the global LRU victim across all layers. Used for live
+    // mode where physical VRAM slots are shared across layers — typical
+    // realistic budget on 16 GB VRAM is l1_capacity ≈ 6 globally vs ~32 per
+    // layer in shadow mode. L2 stays per-layer in either mode.
     ThreeTierCache(int32_t n_layers,
                    int32_t n_experts_per_layer,
                    int32_t l1_capacity,
                    int32_t l2_capacity,
-                   bool    shadow_mode = true);
+                   bool    shadow_mode = true,
+                   bool    global_l1   = false);
 
     // Queries
     ExpertLocation location_of(int32_t layer, int32_t expert) const;
@@ -97,6 +105,20 @@ public:
                         const int32_t * experts,
                         int32_t count);
 
+    // Confidence-gated L2->L1 promotion. When threshold >= 0, prefetch_to_l1
+    // promotes L2-resident experts to L1 if predictor_confidence >= threshold.
+    // When threshold < 0 (default), preserves skip-if-resident behavior:
+    // L2-resident experts only get an LRU bump from prefetch_to_l1.
+    //
+    // For shadow mode at l1=32/l2=80, the default (-1.0 = disabled) is correct
+    // because L2 already absorbs everything past L1 in this regime. For live
+    // mode where L1 is small and physical, set threshold to ~0.05-0.10 to
+    // pull confident predictions from L2 into the VRAM-resident L1 cache
+    // ahead of access. Per Phase 5 finding, this is the unblocker for the
+    // L1-hit-rate-dominated wall-clock regime.
+    void  set_l2_promote_threshold(float threshold) { l2_promote_threshold_ = threshold; }
+    float l2_promote_threshold() const { return l2_promote_threshold_; }
+
     // Diagnostics
     CacheStats stats() const;
     const std::vector<CacheEvent> & events() const { return events_; }
@@ -113,6 +135,8 @@ private:
     int32_t l1_capacity_;
     int32_t l2_capacity_;
     bool    shadow_mode_;
+    bool    global_l1_mode_;
+    float   l2_promote_threshold_ = -1.0f;     // < 0 = disabled (skip-if-resident)
 
     // Location map: locations_[layer * n_experts_per_layer_ + expert]
     std::vector<ExpertLocation> locations_;
@@ -130,8 +154,31 @@ private:
         bool   remove(int32_t e);                                  // returns true if present
         int32_t pop_oldest();                                      // returns and removes back
     };
-    std::vector<LRU> l1_lru_;
+    std::vector<LRU> l1_lru_;   // unused when global_l1_mode_
     std::vector<LRU> l2_lru_;
+
+    // Global L1 LRU — used when global_l1_mode_. Single LRU across all layers,
+    // entries keyed by packed (layer, expert) int64. Total capacity is
+    // l1_capacity_ globally (not per-layer).
+    struct GlobalLRU {
+        std::list<int64_t> order;                                              // front=newest, back=oldest
+        std::unordered_map<int64_t, std::list<int64_t>::iterator> by_key;
+        static int64_t make_key(int32_t l, int32_t e) {
+            return ((int64_t)l << 32) | (uint32_t)e;
+        }
+        static int32_t key_layer (int64_t k) { return (int32_t)(k >> 32); }
+        static int32_t key_expert(int64_t k) { return (int32_t)(k & 0xFFFFFFFF); }
+        size_t size()                       const { return order.size(); }
+        bool   contains(int32_t l, int32_t e) const {
+            return by_key.find(make_key(l, e)) != by_key.end();
+        }
+        void   bump  (int32_t l, int32_t e);
+        void   insert(int32_t l, int32_t e);
+        bool   remove(int32_t l, int32_t e);
+        // Pop the oldest entry; returns (layer, expert) or (-1, -1) if empty.
+        std::pair<int32_t, int32_t> pop_oldest();
+    };
+    GlobalLRU l1_global_lru_;
 
     // Access counts for LFU + predictor confidence weighting on L1 evictions.
     std::vector<uint64_t> access_count_;             // [layer * n_experts + expert]
@@ -164,9 +211,10 @@ private:
     // Internals
     void _promote(int32_t layer, int32_t expert,
                   ExpertLocation from, ExpertLocation to);
-    void _make_room_in_l1(int32_t layer);
+    void _make_room_in_l1(int32_t layer);          // dispatches per-layer / global
     void _make_room_in_l2(int32_t layer);
-    int32_t _pick_l1_victim(int32_t layer);
+    int32_t _pick_l1_victim(int32_t layer);                                   // per-layer mode
+    std::pair<int32_t, int32_t> _pick_l1_victim_global();                     // global mode
     void _log(CacheEvent::Kind kind, int32_t layer, int32_t expert);
 
     inline size_t _idx(int32_t layer, int32_t expert) const {

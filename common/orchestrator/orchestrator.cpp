@@ -28,7 +28,8 @@ Orchestrator::Orchestrator(const OrchestratorConfig &  config,
              n_experts_per_layer,
              config.l1_capacity,
              config.l2_capacity,
-             config.shadow_mode)
+             config.shadow_mode,
+             config.global_l1)
 {
     // Empty path = recency-only mode (Mode A): orchestrator observes routing
     // and runs the cache, but skips MLP prefetch entirely.
@@ -49,7 +50,11 @@ Orchestrator::Orchestrator(const OrchestratorConfig &  config,
 
     embedding_window_.reserve(config.embedding_window_tokens);
     scratch_top_.resize(config.l1_prefetch_top_k);
+    scratch_conf_.resize(config.l1_prefetch_top_k);
     last_topk_indices_.resize((size_t)n_layers);
+
+    // Plumb the L2 promote threshold (cache default is -1.0 = disabled).
+    cache_.set_l2_promote_threshold(config.l2_promote_threshold);
 
     if (!config_.dump_trace_path.empty()) {
         trace_buf_.resize((size_t)n_layers);
@@ -97,12 +102,17 @@ void Orchestrator::on_layer_input(int32_t layer, const float * hidden_state) {
         int32_t target_layer = layer + M;
         if (target_layer >= n_layers_) continue;
 
+        // When confidence-gated L2->L1 promotion is on, request softmax
+        // confidences from the predictor. Otherwise skip (saves the n_experts
+        // exp() pass + normalization in the predictor inner loop).
+        const bool want_conf = (config_.l2_promote_threshold >= 0.0f);
         auto t0 = std::chrono::steady_clock::now();
         bool ok = l1_predictor_.predict_top_k(layer,
                                               M,
                                               hidden_state,
                                               config_.l1_prefetch_top_k,
-                                              scratch_top_.data());
+                                              scratch_top_.data(),
+                                              want_conf ? scratch_conf_.data() : nullptr);
         auto t1 = std::chrono::steady_clock::now();
         l1_predictor_total_ns_ +=
             (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -111,7 +121,8 @@ void Orchestrator::on_layer_input(int32_t layer, const float * hidden_state) {
         if (ok) {
             cache_.prefetch_to_l1(target_layer,
                                   scratch_top_.data(),
-                                  config_.l1_prefetch_top_k);
+                                  config_.l1_prefetch_top_k,
+                                  want_conf ? scratch_conf_.data() : nullptr);
         }
     }
 }

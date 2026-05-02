@@ -42,6 +42,20 @@ struct OrchestratorConfig {
     // Mode.
     bool    shadow_mode            = true;
 
+    // Global L1 cache mode. When true, l1_capacity is total slots across all
+    // layers (not per-layer). Used for live mode where physical VRAM slots
+    // are a shared global resource. L2 stays per-layer in either mode.
+    bool    global_l1              = false;
+
+    // Confidence-gated L2->L1 promotion threshold. Default -1.0 = disabled
+    // (preserves skip-if-resident; correct for shadow mode at wide L2).
+    // Set to a positive value (typically 0.05-0.20) to enable: when the
+    // predictor's softmax confidence in an L2-resident expert exceeds this
+    // threshold, the expert is promoted to L1 ahead of the actual access.
+    // This is the L1-hit-rate lift required for live mode where L1 is small
+    // physical VRAM and L1 misses cost a real cudaMemcpyAsync.
+    float   l2_promote_threshold   = -1.0f;
+
     // Trace dump (offline predictor training data). Empty path = disabled.
     // When set, the orchestrator writes a binary trace of every
     //   (layer, hidden_state, top_k_indices, top_k_weights)
@@ -121,7 +135,8 @@ private:
     double   l2_predictor_total_ns_ = 0.0;
 
     // Reusable scratch — avoids per-call allocations.
-    std::vector<int32_t> scratch_top_;     // size l1_prefetch_top_k
+    std::vector<int32_t> scratch_top_;       // size l1_prefetch_top_k
+    std::vector<float>   scratch_conf_;      // size l1_prefetch_top_k (used iff l2_promote_threshold_ enabled)
 
     // Per-layer buffer of the most recent topk indices we've seen. Populated
     // by on_routing, consumed by on_routing_weights to pair weights→experts.

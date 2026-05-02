@@ -39,20 +39,56 @@ int32_t ThreeTierCache::LRU::pop_oldest() {
     return e;
 }
 
+// ---------- GlobalLRU helpers ----------
+
+void ThreeTierCache::GlobalLRU::bump(int32_t l, int32_t e) {
+    int64_t k = make_key(l, e);
+    auto it = by_key.find(k);
+    if (it == by_key.end()) return;
+    order.erase(it->second);
+    order.push_front(k);
+    it->second = order.begin();
+}
+
+void ThreeTierCache::GlobalLRU::insert(int32_t l, int32_t e) {
+    int64_t k = make_key(l, e);
+    order.push_front(k);
+    by_key[k] = order.begin();
+}
+
+bool ThreeTierCache::GlobalLRU::remove(int32_t l, int32_t e) {
+    int64_t k = make_key(l, e);
+    auto it = by_key.find(k);
+    if (it == by_key.end()) return false;
+    order.erase(it->second);
+    by_key.erase(it);
+    return true;
+}
+
+std::pair<int32_t, int32_t> ThreeTierCache::GlobalLRU::pop_oldest() {
+    if (order.empty()) return {-1, -1};
+    int64_t k = order.back();
+    order.pop_back();
+    by_key.erase(k);
+    return { key_layer(k), key_expert(k) };
+}
+
 // ---------- ctor ----------
 
 ThreeTierCache::ThreeTierCache(int32_t n_layers,
                                int32_t n_experts_per_layer,
                                int32_t l1_capacity,
                                int32_t l2_capacity,
-                               bool    shadow_mode)
+                               bool    shadow_mode,
+                               bool    global_l1)
     : n_layers_(n_layers),
       n_experts_per_layer_(n_experts_per_layer),
       l1_capacity_(l1_capacity),
       l2_capacity_(l2_capacity),
       shadow_mode_(shadow_mode),
+      global_l1_mode_(global_l1),
       locations_((size_t)n_layers * n_experts_per_layer, ExpertLocation::L3_NVME),
-      l1_lru_((size_t)n_layers),
+      l1_lru_(global_l1 ? 0 : (size_t)n_layers),
       l2_lru_((size_t)n_layers),
       access_count_((size_t)n_layers * n_experts_per_layer, 0),
       predictor_confidence_((size_t)n_layers * n_experts_per_layer, 0.0f),
@@ -86,8 +122,16 @@ bool ThreeTierCache::is_in_l1(int32_t layer, int32_t expert) const {
 
 std::vector<int32_t> ThreeTierCache::l1_contents(int32_t layer) const {
     std::vector<int32_t> out;
-    out.reserve(l1_lru_[layer].order.size());
-    for (auto e : l1_lru_[layer].order) out.push_back(e);
+    if (global_l1_mode_) {
+        for (int64_t k : l1_global_lru_.order) {
+            if (GlobalLRU::key_layer(k) == layer) {
+                out.push_back(GlobalLRU::key_expert(k));
+            }
+        }
+    } else {
+        out.reserve(l1_lru_[layer].order.size());
+        for (auto e : l1_lru_[layer].order) out.push_back(e);
+    }
     return out;
 }
 
@@ -107,7 +151,8 @@ ExpertLocation ThreeTierCache::access(int32_t layer, int32_t expert) {
 
     switch (loc) {
         case ExpertLocation::L1_VRAM:
-            l1_lru_[layer].bump(expert);
+            if (global_l1_mode_) l1_global_lru_.bump(layer, expert);
+            else                 l1_lru_[layer].bump(expert);
             _log(CacheEvent::HIT_L1, layer, expert);
             return loc;
 
@@ -149,9 +194,23 @@ void ThreeTierCache::prefetch_to_l1(int32_t layer,
         predictor_confidence_[_idx(layer, e)] = c;
         ExpertLocation loc = locations_[_idx(layer, e)];
         if (loc == ExpertLocation::L1_VRAM) {
-            l1_lru_[layer].bump(e);
+            if (global_l1_mode_) l1_global_lru_.bump(layer, e);
+            else                 l1_lru_[layer].bump(e);
         } else if (loc == ExpertLocation::L2_RAM) {
-            l2_lru_[layer].bump(e);
+            // Confidence-gated L2->L1 promotion (Phase 5 finding):
+            // when threshold >= 0 AND this prediction is confident enough,
+            // pull the expert from L2 (RAM) up to L1 (VRAM) so it's resident
+            // by the time the model actually accesses it. This is the
+            // L1-hit-rate lift the live-mode wall clock needs.
+            //
+            // When threshold < 0 (default), preserves the original skip-if-
+            // resident behavior — just bump L2 LRU, no promotion. That's
+            // correct for shadow mode at wide L2 (cf. Phase 1/2).
+            if (l2_promote_threshold_ >= 0.0f && c >= l2_promote_threshold_) {
+                _promote(layer, e, ExpertLocation::L2_RAM, ExpertLocation::L1_VRAM);
+            } else {
+                l2_lru_[layer].bump(e);
+            }
         } else {
             _promote(layer, e, ExpertLocation::L3_NVME, ExpertLocation::L1_VRAM);
         }
@@ -179,7 +238,8 @@ void ThreeTierCache::_promote(int32_t layer, int32_t expert,
                               ExpertLocation from, ExpertLocation to) {
     if (to == ExpertLocation::L1_VRAM) {
         _make_room_in_l1(layer);
-        l1_lru_[layer].insert(expert);
+        if (global_l1_mode_) l1_global_lru_.insert(layer, expert);
+        else                 l1_lru_[layer].insert(expert);
         if (from == ExpertLocation::L2_RAM) l2_lru_[layer].remove(expert);
         locations_[_idx(layer, expert)] = ExpertLocation::L1_VRAM;
         if (from == ExpertLocation::L2_RAM) {
@@ -196,14 +256,29 @@ void ThreeTierCache::_promote(int32_t layer, int32_t expert,
 }
 
 void ThreeTierCache::_make_room_in_l1(int32_t layer) {
-    while ((int32_t)l1_lru_[layer].size() >= l1_capacity_) {
-        int32_t victim = _pick_l1_victim(layer);
-        l1_lru_[layer].remove(victim);
-        // Demote to L2 (if room; otherwise this triggers L2->L3 eviction below).
-        _make_room_in_l2(layer);
-        l2_lru_[layer].insert(victim);
-        locations_[_idx(layer, victim)] = ExpertLocation::L2_RAM;
-        _log(CacheEvent::EVICT_L1_TO_L2, layer, victim);
+    if (global_l1_mode_) {
+        // Global L1 budget is total across all layers — eviction picks the
+        // worst-scoring entry across the whole pool, demotes it to that
+        // entry's own layer's L2.
+        while ((int32_t)l1_global_lru_.size() >= l1_capacity_) {
+            auto [vlayer, vexpert] = _pick_l1_victim_global();
+            if (vlayer < 0) break;
+            l1_global_lru_.remove(vlayer, vexpert);
+            _make_room_in_l2(vlayer);
+            l2_lru_[vlayer].insert(vexpert);
+            locations_[_idx(vlayer, vexpert)] = ExpertLocation::L2_RAM;
+            _log(CacheEvent::EVICT_L1_TO_L2, vlayer, vexpert);
+        }
+    } else {
+        while ((int32_t)l1_lru_[layer].size() >= l1_capacity_) {
+            int32_t victim = _pick_l1_victim(layer);
+            l1_lru_[layer].remove(victim);
+            // Demote to L2 (if room; otherwise this triggers L2->L3 eviction below).
+            _make_room_in_l2(layer);
+            l2_lru_[layer].insert(victim);
+            locations_[_idx(layer, victim)] = ExpertLocation::L2_RAM;
+            _log(CacheEvent::EVICT_L1_TO_L2, layer, victim);
+        }
     }
 }
 
@@ -239,6 +314,32 @@ int32_t ThreeTierCache::_pick_l1_victim(int32_t layer) {
         }
     }
     return best_victim;
+}
+
+std::pair<int32_t, int32_t> ThreeTierCache::_pick_l1_victim_global() {
+    // Same scoring function as the per-layer variant, but applied across the
+    // entire global pool. Returns (layer, expert) of the worst-scoring entry.
+    //
+    // O(N) where N = global_l1_capacity (typically 4-32). Negligible cost
+    // because eviction only fires when L1 is full and a new entry is coming
+    // in — same call frequency as a per-layer eviction.
+    int32_t best_layer   = -1;
+    int32_t best_expert  = -1;
+    double  best_score   = 1e308;
+    for (int64_t k : l1_global_lru_.order) {
+        int32_t l = GlobalLRU::key_layer(k);
+        int32_t e = GlobalLRU::key_expert(k);
+        const size_t idx = _idx(l, e);
+        const double score = (double)access_count_[idx]
+                           + 100.0 * (double)router_weight_[idx]
+                           +  10.0 * (double)predictor_confidence_[idx];
+        if (score < best_score) {
+            best_score  = score;
+            best_layer  = l;
+            best_expert = e;
+        }
+    }
+    return { best_layer, best_expert };
 }
 
 void ThreeTierCache::_log(CacheEvent::Kind kind, int32_t layer, int32_t expert) {
