@@ -51,7 +51,7 @@ struct test_args {
     //   --orchestrator-recency-only      => Mode A (recency-only, no MLP)
     //   neither                          => no orchestrator (baseline)
     bool        orchestrator_recency_only = false;
-    int         l1_capacity                = 32;
+    int         l1_capacity                = 0;  // 0 = dynamic-fit (init_dynamic)
     int         l2_capacity                = 80;
     int         prefetch_top_k             = 16;
     bool        global_l1                  = false;
@@ -94,7 +94,8 @@ static void print_usage(const char * prog) {
         "  --tier2-ram-headroom FRAC        host-RAM headroom reserve for auto sizing (default 0.40)\n"
         "  --mode-b-graceful                drop -INF mask (gate selects freely; pair with Hopfield)\n"
         "  --orchestrator-recency-only      enable orchestrator without predictor (Mode A)\n"
-        "  --l1 N                           L1 (VRAM) cache capacity (per layer; total if --global-l1) (default 32)\n"
+        "  --l1 N                           L1 (VRAM) cache capacity (per layer; total if --global-l1)\n"
+        "                                   (0 = dynamic VRAM-fit; default 0)\n"
         "  --l2 N                           L2 (RAM)  cache capacity per layer (default 80)\n"
         "  --prefetch-top-k N               experts the MLP prefetches per call (default 16)\n"
         "  --global-l1                      L1 is a global pool of slots across all layers\n"
@@ -220,6 +221,19 @@ static int read_n_experts_from_model(llama_model * model) {
     return 128;
 }
 
+static int read_top_k_from_model(llama_model * model) {
+    // expert_used_count = top_k. Try arch-specific then generic key.
+    char buf[64];
+    int len = llama_model_meta_val_str(model, "qwen3moe.expert_used_count", buf, sizeof(buf));
+    if (len > 0) return std::atoi(buf);
+    len = llama_model_meta_val_str(model, "deepseek2.expert_used_count", buf, sizeof(buf));
+    if (len > 0) return std::atoi(buf);
+    len = llama_model_meta_val_str(model, "general.expert_used_count", buf, sizeof(buf));
+    if (len > 0) return std::atoi(buf);
+    std::fprintf(stderr, "WARN: could not read expert_used_count; defaulting to 8\n");
+    return 8;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -303,9 +317,20 @@ int main(int argc, char ** argv) {
     if (args.orchestrator_mode == "slot") {
         // Mode B's n_slot reuses the existing --l1 capacity flag for natural
         // continuity with the shadow-mode sweeps (Phases 5/6). Default 32.
-        const int n_slot = args.l1_capacity;
+        // n_slot=0 (default) => dynamic VRAM-fit sizing per commit #13a.
+        // n_slot>0 (explicit --l1 N) => keep deterministic for tests.
+        const int n_slot_request = args.l1_capacity;
+        const int top_k_model = read_top_k_from_model(model);
         mode_b_ctx = std::make_unique<moe_orch::ModeBContext>();
-        if (!mode_b_ctx->init(model, n_layers, n_experts, n_slot, /*device_id=*/0)) {
+        bool init_ok;
+        if (n_slot_request <= 0) {
+            init_ok = mode_b_ctx->init_dynamic(model, n_layers, n_experts,
+                                               top_k_model, /*device_id=*/0);
+        } else {
+            init_ok = mode_b_ctx->init(model, n_layers, n_experts,
+                                       n_slot_request, /*device_id=*/0);
+        }
+        if (!init_ok) {
             std::fprintf(stderr, "[stage7] ModeBContext init FAILED — falling back to no Mode B\n");
             mode_b_ctx.reset();
         } else {

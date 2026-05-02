@@ -520,6 +520,147 @@ int ModeBContext::refresh_slots() {
     return updates;
 }
 
+// ---- Commit #13a: VRAM probe + dynamic n_slot/tile sizing ----
+
+bool ModeBContext::init_dynamic(const llama_model * model,
+                                int n_layer, int n_expert, int top_k, int device_id,
+                                size_t reserved_vram_bytes) {
+    if (!model || n_layer <= 0 || n_expert <= 0 || top_k <= 0) {
+        std::fprintf(stderr, "[mode_b] init_dynamic: bad params "
+                             "(model=%p n_layer=%d n_expert=%d top_k=%d)\n",
+                     (const void *)model, n_layer, n_expert, top_k);
+        return false;
+    }
+
+    // Probe VRAM via ggml's backend wrapper.
+    size_t free_vram = 0, total_vram = 0;
+    ggml_backend_cuda_get_device_memory(device_id, &free_vram, &total_vram);
+    if (total_vram == 0) {
+        std::fprintf(stderr, "[mode_b] init_dynamic: ggml_backend_cuda_get_device_memory "
+                             "returned 0; falling back to default n_slot=top_k=%d\n", top_k);
+        free_vram = (size_t)4 * 1024 * 1024 * 1024;  // assume 4 GB free
+    }
+
+    // Compute per-slot byte cost from a probe layer's expert tensors.
+    // Walk model tensors by name to find a representative MoE layer.
+    size_t per_expert_up = 0, per_expert_gate = 0, per_expert_down = 0;
+    for (int il = 0; il < n_layer; il++) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_up_exps.weight", il);
+        ggml_tensor * up = llama_model_get_tensor(model, nm);
+        if (!up) continue;
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
+        ggml_tensor * down = llama_model_get_tensor(model, nm);
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_exps.weight", il);
+        ggml_tensor * gate = llama_model_get_tensor(model, nm);
+        if (!up || !down) continue;
+
+        per_expert_up   = ggml_nbytes(up)   / (size_t)n_expert;
+        per_expert_down = ggml_nbytes(down) / (size_t)n_expert;
+        per_expert_gate = gate ? ggml_nbytes(gate) / (size_t)n_expert : 0;
+        break;
+    }
+    if (per_expert_up == 0) {
+        std::fprintf(stderr, "[mode_b] init_dynamic: no MoE layer found\n");
+        return false;
+    }
+    // Per LAYER per SLOT byte cost: one slot worth of all three kinds.
+    const size_t per_layer_per_slot = per_expert_up + per_expert_gate + per_expert_down;
+
+    // Count active MoE layers (some hybrid arches have dense layers we skip).
+    int n_moe_layers = 0;
+    for (int il = 0; il < n_layer; il++) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "blk.%d.ffn_up_exps.weight", il);
+        if (llama_model_get_tensor(model, nm)) n_moe_layers++;
+    }
+    if (n_moe_layers == 0) {
+        std::fprintf(stderr, "[mode_b] init_dynamic: 0 MoE layers found\n");
+        return false;
+    }
+
+    // Per-n_slot VRAM cost: n_moe_layers * per_layer_per_slot.
+    const size_t bytes_per_slot_step = (size_t)n_moe_layers * per_layer_per_slot;
+
+    // Available budget = free_vram - reserved_vram_bytes (compute graph + KV + activations).
+    const size_t budget = (free_vram > reserved_vram_bytes)
+        ? free_vram - reserved_vram_bytes : 0;
+
+    // Largest n_slot that fits in budget.
+    int n_slot_max = (bytes_per_slot_step > 0) ? (int)(budget / bytes_per_slot_step) : 0;
+    n_slot_max = std::min(n_slot_max, n_expert);
+
+    // Three tiers: optimal, recommended, floor.
+    const int n_slot_optimal     = std::min(2 * top_k, n_expert);
+    const int n_slot_recommended = std::min(top_k, n_expert);
+
+    // Pick.
+    int n_slot_actual;
+    int tile_size;
+    bool degraded;
+    const char * label;
+    if (n_slot_max >= n_slot_optimal) {
+        n_slot_actual = n_slot_optimal;
+        tile_size     = top_k;
+        degraded      = false;
+        label         = "optimal";
+    } else if (n_slot_max >= n_slot_recommended) {
+        n_slot_actual = n_slot_max;       // use everything we can up to optimal
+        tile_size     = top_k;
+        degraded      = false;
+        label         = "recommended";
+    } else if (n_slot_max >= 1) {
+        n_slot_actual = n_slot_max;
+        tile_size     = n_slot_max;
+        degraded      = true;
+        label         = "degraded";
+    } else {
+        std::fprintf(stderr, "[mode_b] init_dynamic: not enough VRAM for even 1 slot "
+                             "(budget=%zu bytes, per_slot=%zu bytes)\n",
+                     budget, bytes_per_slot_step);
+        return false;
+    }
+    const int n_tiles = (top_k + tile_size - 1) / tile_size;
+
+    // Save sizing decision.
+    sizing_.free_vram_bytes        = free_vram;
+    sizing_.total_vram_bytes       = total_vram;
+    sizing_.per_layer_per_slot_bytes = per_layer_per_slot;
+    sizing_.reserved_bytes         = reserved_vram_bytes;
+    sizing_.top_k                  = top_k;
+    sizing_.n_slot_optimal         = n_slot_optimal;
+    sizing_.n_slot_recommended     = n_slot_recommended;
+    sizing_.n_slot_actual          = n_slot_actual;
+    sizing_.tile_size              = tile_size;
+    sizing_.n_tiles                = n_tiles;
+    sizing_.degraded_mode          = degraded;
+    sizing_.mode_label             = label;
+
+    // Print sizing decision. The "degraded" message is the one Chris specified.
+    const double GiB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+    std::printf("[mode_b] VRAM probe: %.2f GB free / %.2f GB total (reserved %.2f GB for compute)\n",
+                free_vram * GiB, total_vram * GiB, reserved_vram_bytes * GiB);
+    std::printf("[mode_b]   per-slot cost: %.2f MB/expert all-kinds across %d MoE layers\n",
+                per_layer_per_slot / (1024.0 * 1024.0), n_moe_layers);
+    std::printf("[mode_b]   sizing tiers: optimal n_slot=%d, recommended=%d, max-fit=%d\n",
+                n_slot_optimal, n_slot_recommended, n_slot_max);
+    std::printf("[mode_b]   selected: n_slot=%d, tile_size=%d, n_tiles=%d (mode=%s)\n",
+                n_slot_actual, tile_size, n_tiles, label);
+    if (degraded) {
+        std::printf("\n");
+        std::printf("[mode_b] *** System VRAM is below the recommended size for this model. ***\n");
+        std::printf("[mode_b] *** Dynamically adjusting n_slot=%d, tiling FFN across %d passes ***\n",
+                    n_slot_actual, n_tiles);
+        std::printf("[mode_b] *** to fit VRAM constraints. Quality is preserved (full top_k=%d ***\n",
+                    top_k);
+        std::printf("[mode_b] *** weighted sum); expect %dx kernel-launch overhead at the FFN. ***\n",
+                    n_tiles);
+        std::printf("\n");
+    }
+
+    return init(model, n_layer, n_expert, n_slot_actual, device_id);
+}
+
 // ---- Commit #10: Tier 2 pinned host buffer ----
 
 // Read /proc/meminfo MemAvailable (Linux) and return bytes. Returns 0 on

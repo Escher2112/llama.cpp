@@ -121,6 +121,47 @@ public:
     int n_expert() const { return n_expert_; }
     bool active() const { return ctx_ != nullptr && backend_buffer_ != nullptr; }
 
+    // ---- Dynamic sizing decision (commit #13a) ----
+    //
+    // Output of init_dynamic(). Carried for diagnostics + the user-facing
+    // "VRAM below recommended" message.
+    struct SizingDecision {
+        size_t free_vram_bytes        = 0;
+        size_t total_vram_bytes       = 0;
+        size_t per_layer_per_slot_bytes = 0;  // up + gate + down per expert per layer
+        size_t reserved_bytes         = 0;    // compute graph + KV cache + activations
+        int    top_k                  = 0;    // model's expert_used_count
+        int    n_slot_optimal         = 0;    // 2 * top_k (clean batched prefill)
+        int    n_slot_recommended     = 0;    // top_k (no tile overhead)
+        int    n_slot_actual          = 0;    // what we picked
+        int    tile_size              = 0;    // == top_k if no tiling, else == n_slot_actual
+        int    n_tiles                = 1;    // ceil(top_k / tile_size)
+        bool   degraded_mode          = false;
+        const char * mode_label       = "optimal";
+    };
+
+    // Probe available VRAM and pick (n_slot, tile_size) per the policy:
+    //   1. If we can fit n_slot >= 2 * top_k: optimal mode. tile_size = top_k. No tiling.
+    //   2. Elif we can fit n_slot >= top_k: recommended mode. tile_size = top_k. No tiling.
+    //   3. Else: degraded mode. n_slot = the largest that fits, tile_size = n_slot,
+    //            n_tiles = ceil(top_k / tile_size). Print user-facing warning.
+    //
+    // This makes n_slot a configurable speed dial, not a correctness gate.
+    // Quality is preserved at all sizes: tiled FFN computes the full top_k
+    // weighted sum; only the kernel-launch count grows.
+    //
+    // top_k: the model's expert_used_count (caller queries from metadata).
+    // n_layer / n_expert / device_id: same as init().
+    //
+    // After this returns true, init() has been called internally with the
+    // chosen n_slot. Caller should still call init_tier2() / init_tier2_auto()
+    // afterward.
+    bool init_dynamic(const llama_model * model,
+                      int n_layer, int n_expert, int top_k, int device_id,
+                      size_t reserved_vram_bytes = 1ULL << 30 /* 1 GB */);
+
+    const SizingDecision & sizing() const { return sizing_; }
+
     // ---- Graceful-mask mode (commit #9) ----
     //
     // When OFF (default for backwards-compat): valid_mask carries -INFINITY
@@ -250,6 +291,7 @@ private:
     int n_tier2_  = 0;
     int device_id_ = 0;
     bool graceful_mask_ = false;
+    SizingDecision sizing_;
     ggml_context *           ctx_            = nullptr;
     ggml_backend_buffer_t    backend_buffer_ = nullptr;
     std::vector<ModeBLayer>  layers_;
