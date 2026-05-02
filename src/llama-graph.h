@@ -828,6 +828,17 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    //
+    // slot_map (optional, default nullptr): for Mode-B live-mode slot-mapped
+    // expert weights. When non-null, after the gate's argsort_top_k produces
+    // selected_experts, those expert indices are remapped via
+    // ggml_get_rows(slot_map, selected_experts) before being used to index
+    // into up_exps/gate_exps/down_exps. The slot_map tensor is shape
+    // [n_expert] (one entry per expert) holding the slot index where that
+    // expert's weights currently live (0..n_slot-1) or a sentinel for
+    // unmapped. The orchestrator maintains slot_map's contents via
+    // ggml_backend_tensor_set between forward passes.
+    // No effect when nullptr — preserves the original code path.
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
@@ -846,7 +857,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * slot_map = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -871,7 +883,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * slot_map = nullptr) const;  // see comment on the no-bias overload
 
     //
     // inputs

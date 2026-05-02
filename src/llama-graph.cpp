@@ -1320,7 +1320,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * slot_map) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1340,7 +1341,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        slot_map
     );
 }
 
@@ -1367,7 +1369,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * slot_map) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1453,6 +1456,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // Mode B (slot-mapped) live-mode remap. When slot_map is non-null,
+    // the gate's expert IDs ([0, n_expert)) get translated through the
+    // slot_map ([n_expert] tensor of slot indices) to slot IDs
+    // ([0, n_slot)) that index into the SMALLER per-layer expert tensors
+    // allocated by the orchestrator. The orchestrator updates slot_map's
+    // contents via ggml_backend_tensor_set between forward passes based
+    // on its predictor + tiered cache decisions.
+    //
+    // selected_experts shape: [n_expert_used, n_tokens]
+    // slot_map shape: [n_expert]
+    // ggml_get_rows of a 1D source tensor with 2D index tensor yields a
+    // tensor of the index tensor's shape with looked-up values — exactly
+    // what we need. No-op when slot_map is null.
+    if (slot_map != nullptr) {
+        selected_experts = ggml_get_rows(ctx0, slot_map, selected_experts);
+        cb(selected_experts, "ffn_moe_topk_slotmapped", il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
