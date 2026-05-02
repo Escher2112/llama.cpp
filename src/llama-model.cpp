@@ -9469,6 +9469,10 @@ bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
 }
 
+struct ggml_tensor * llama_model_get_tensor(const llama_model * model, const char * name) {
+    return const_cast<struct ggml_tensor *>(model->get_tensor(name));
+}
+
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
 }

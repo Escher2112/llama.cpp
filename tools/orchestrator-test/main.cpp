@@ -48,6 +48,12 @@ struct test_args {
     float       l2_promote_threshold       = -1.0f;   // < 0 = disabled
     std::string dump_trace_path;          // --dump-trace PATH
     std::string prompts_file;             // --prompts-file PATH (1 prompt per line)
+    // SPIKE: between prompt 0 and prompt 1, zero an expert tensor.
+    // Tests whether ggml respects mid-execution tensor data mutation.
+    // Format: "L,E" where L=layer index, E=expert index (within that layer's
+    // ffn_*_exps), e.g. "5,0" zeros the FIRST expert of layer 5.
+    // Empty/unset = no mutation.
+    std::string spike_mutate;
 };
 
 static void print_usage(const char * prog) {
@@ -97,6 +103,8 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "--global-l1")          a.global_l1 = true;
         else if (arg == "--l2-promote-threshold" && need("--l2-promote-threshold"))
                                                 a.l2_promote_threshold = (float)std::atof(argv[++i]);
+        else if (arg == "--spike-mutate" && need("--spike-mutate"))
+                                                a.spike_mutate = argv[++i];
         else if (arg == "--dump-trace" && need("--dump-trace"))
                                                 a.dump_trace_path = argv[++i];
         else if (arg == "--prompts-file" && need("--prompts-file"))
@@ -132,6 +140,13 @@ int main(int argc, char ** argv) {
     // ---- Phase 1: load model ----
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = args.n_gpu_layers;
+    // Spike test mutates expert tensors via ggml_backend_tensor_set, which
+    // segfaults on mmap'd-read-only model storage. Disable mmap when spike
+    // is requested. Has no effect in production (live mode owns the buffer).
+    if (!args.spike_mutate.empty()) {
+        mparams.use_mmap = false;
+        std::printf("[SPIKE] mmap disabled for spike test\n");
+    }
     // Apply the same expert-on-CPU override the baseline benchmark uses.
     // This is via the tensor-buft override mechanism. The CLI-equivalent of
     // --override-tensor "exps.=CPU" maps to this struct.
@@ -337,22 +352,63 @@ int main(int argc, char ** argv) {
         prompts.push_back(args.prompt);
     }
 
+    // SPIKE state — populated when --spike-mutate is set.
+    // We capture the original tensor contents before mutation so we can
+    // restore + verify ggml_backend_tensor_set is what's being read.
+    struct SpikeState {
+        bool            active = false;
+        int             layer = -1;
+        int             expert = -1;
+        struct ggml_tensor * t = nullptr;
+        std::vector<uint8_t> orig_bytes;
+    };
+    SpikeState spike;
+    if (!args.spike_mutate.empty()) {
+        size_t comma = args.spike_mutate.find(',');
+        if (comma != std::string::npos) {
+            spike.layer  = std::atoi(args.spike_mutate.substr(0, comma).c_str());
+            spike.expert = std::atoi(args.spike_mutate.substr(comma + 1).c_str());
+            char tname[64];
+            std::snprintf(tname, sizeof(tname), "blk.%d.ffn_up_exps.weight", spike.layer);
+            spike.t = llama_model_get_tensor(model, tname);
+            if (!spike.t) {
+                std::fprintf(stderr, "[SPIKE] tensor %s not found — disabled\n", tname);
+            } else {
+                spike.active = true;
+                size_t total = ggml_nbytes(spike.t);
+                spike.orig_bytes.resize(total);
+                ggml_backend_tensor_get(spike.t, spike.orig_bytes.data(), 0, total);
+                std::printf("[SPIKE] armed: layer=%d expert=%d tensor=%s size=%zu bytes\n",
+                            spike.layer, spike.expert, tname, total);
+            }
+        }
+    }
+
     for (size_t pi = 0; pi < prompts.size(); pi++) {
         if (prompts.size() > 1) {
             std::printf("\n--- prompt %d/%d ---\n", (int)(pi + 1), (int)prompts.size());
-            // Clear KV cache so prompts are independent (important for trace
-            // capture so the predictor doesn't pick up cross-prompt artifacts).
             llama_memory_clear(llama_get_memory(ctx), true);
-            // Drop the orchestrator's audit event log between prompts. Stats
-            // live in scalar counters now (see ThreeTierCache::_log) so they
-            // accumulate correctly across the run; this just prevents events_
-            // from growing toward its 4M cap. At L1=8/L2=32 Mode B that cap
-            // was reachable mid-run and the surrounding heap pressure tripped
-            // the prompt-14 abort. Cumulative summary still reports correctly
-            // at the end of the run.
             if (orchestrator) orchestrator->clear_cache_events();
         }
+
+        // SPIKE: before prompt index 1, mutate the expert tensor.
+        // Strategy: zero the WHOLE expert weights tensor for layer L. This
+        // affects ALL experts at that layer, so generated tokens will be
+        // garbage if the mutation takes effect. If the mutation is ignored
+        // (cached pointers), prompt 1 output will match prompt 0.
+        if (spike.active && pi == 1) {
+            std::vector<uint8_t> zeros(spike.orig_bytes.size(), 0);
+            ggml_backend_tensor_set(spike.t, zeros.data(), 0, zeros.size());
+            std::printf("[SPIKE] mutated tensor to all-zeros before prompt %d\n", (int)pi);
+        }
+
         if (!run_one_prompt(prompts[pi])) break;
+
+        // SPIKE: restore the tensor after prompt 1 runs.
+        if (spike.active && pi == 1) {
+            ggml_backend_tensor_set(spike.t, spike.orig_bytes.data(), 0, spike.orig_bytes.size());
+            std::printf("[SPIKE] restored original tensor contents after prompt %d\n", (int)pi);
+        }
     }
     std::printf("\n");
 

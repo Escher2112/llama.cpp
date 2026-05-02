@@ -621,6 +621,12 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Returns a pointer to a model parameter tensor by name (e.g.
+    // "blk.0.ffn_up_exps.weight"), or NULL if not found. The returned
+    // tensor is owned by the model — do not free. Used by the moe-orchestrator
+    // for live-mode expert paging spike-tests; safe for read-only access.
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
