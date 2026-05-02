@@ -168,10 +168,18 @@ int main(int argc, char ** argv) {
             std::printf("[stage7] mode=resident: experts will load to GPU buffer (overriding default CPU pin)\n");
         }
         args.override_exps_cpu = false;
+        std::fprintf(stderr,
+            "[stage7] WARNING: resident mode currently has no live-mode handling for\n"
+            "[stage7]   expert footprint > VRAM. If the model's expert weights exceed\n"
+            "[stage7]   available VRAM minus dense+KV+compute headroom, model load will\n"
+            "[stage7]   fail with cudaMalloc OOM. For consumer GPUs running large MoE\n"
+            "[stage7]   (e.g., 235B Q3 on 16 GB), use --orchestrator-mode slot instead.\n");
     } else if (args.orchestrator_mode == "slot") {
         args.override_exps_cpu = true;
     }
-    // mode == "auto": leave override_exps_cpu at its current value (default true).
+    // mode == "auto": leave override_exps_cpu at its current value (default true,
+    // i.e. behaves as slot). Auto-select with runtime VRAM detection deferred to
+    // post-v0.1 polish per the focused-push plan (Chris, 2026-05-02).
     std::printf("[stage7] orchestrator-mode=%s  experts on %s\n",
                 args.orchestrator_mode.c_str(),
                 args.override_exps_cpu ? "CPU (slot-managed)" : "GPU (resident)");
