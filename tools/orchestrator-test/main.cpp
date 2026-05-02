@@ -226,8 +226,12 @@ int main(int argc, char ** argv) {
     // slot_map defaults to identity (slot_map[e] = e for e in [0, n_slot),
     // others = 0), which is a no-op behaviorally — same outputs as baseline.
     // The full Mode B path lights up in commit #5 + #6.
+    // BUGFIX (2026-05-02): auto mode used to spawn mode_b_ctx unconditionally,
+    // which broke baseline runs (no --orchestrator-mode flag). Until commit #3
+    // adds runtime VRAM-vs-expert detection for auto mode, only explicit "slot"
+    // engages Mode B. "auto" without explicit flag = baseline path.
     std::unique_ptr<moe_orch::ModeBContext> mode_b_ctx;
-    if (args.orchestrator_mode == "slot" || args.orchestrator_mode == "auto") {
+    if (args.orchestrator_mode == "slot") {
         // Mode B's n_slot reuses the existing --l1 capacity flag for natural
         // continuity with the shadow-mode sweeps (Phases 5/6). Default 32.
         const int n_slot = args.l1_capacity;

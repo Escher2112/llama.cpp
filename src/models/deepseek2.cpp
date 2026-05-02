@@ -1,5 +1,9 @@
 #include "models.h"
 
+#ifdef LLAMA_ORCHESTRATOR_BUILD
+#include "../../common/orchestrator/mode_b.h"
+#endif
+
 llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
     // lite variants include DeepSeek-V2-Lite, GigaChat3-10B-A1.8B
@@ -242,11 +246,30 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
+            // Mode B (slot-mapped) live-mode integration. Same pattern as
+            // qwen3moe.cpp — substitute slot tensors when active, pass
+            // slot_map and valid_mask. This is the DeepSeek-V2/V3/R1 path.
+            ggml_tensor * up_use   = model.layers[il].ffn_up_exps;
+            ggml_tensor * gate_use = model.layers[il].ffn_gate_exps;
+            ggml_tensor * down_use = model.layers[il].ffn_down_exps;
+            ggml_tensor * mb_slot_map   = nullptr;
+            ggml_tensor * mb_valid_mask = nullptr;
+#ifdef LLAMA_ORCHESTRATOR_BUILD
+            if (auto * mb = moe_orch::get_mode_b_context()) {
+                if (mb->active()) {
+                    mb_slot_map   = mb->slot_map(il);
+                    mb_valid_mask = mb->valid_mask(il);
+                    if (mb->up_slots(il))   up_use   = mb->up_slots(il);
+                    if (mb->gate_slots(il)) gate_use = mb->gate_slots(il);
+                    if (mb->down_slots(il)) down_use = mb->down_slots(il);
+                }
+            }
+#endif
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
+                up_use,
+                gate_use,
+                down_use,
                 model.layers[il].ffn_exp_probs_b,
                 n_expert, n_expert_used,
                 LLM_FFN_SILU, hparams.expert_weights_norm,
@@ -254,7 +277,12 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il,
                 nullptr,
-                model.layers[il].ffn_gate_up_exps);
+                model.layers[il].ffn_gate_up_exps,
+                /*up_exps_s*/   nullptr,
+                /*gate_exps_s*/ nullptr,
+                /*down_exps_s*/ nullptr,
+                mb_slot_map,
+                mb_valid_mask);
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert
