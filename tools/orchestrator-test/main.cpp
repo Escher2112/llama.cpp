@@ -22,6 +22,7 @@
 #include <chrono>
 #include <clocale>
 #include <cstdio>
+#include <iostream>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -41,6 +42,7 @@ struct test_args {
     int         n_batch         = 512; // --n-batch N (smaller = better graceful-mask correctness on prefill)
     bool        mode_b_graceful = false; // --mode-b-graceful: drop -INF mask
     bool        warmup_prompt_centroid = false; // --warmup-prompt-centroid (opt-in; needs layer-0 Hopfield)
+    bool        chat_mode      = false; // --chat: enter interactive chat REPL after init
     int         n_predict        = 30;
     int         n_gpu_layers      = 99;
     int         n_threads         = 24;
@@ -138,6 +140,7 @@ static bool parse_args(int argc, char ** argv, test_args & a) {
         else if (arg == "--tier2-ram-headroom" && need("--tier2-ram-headroom"))
                                                 a.tier2_ram_headroom = std::atof(argv[++i]);
         else if (arg == "--mode-b-graceful")    a.mode_b_graceful = true;
+        else if (arg == "--chat")               a.chat_mode = true;
         else if (arg == "--warmup-prompt-centroid") a.warmup_prompt_centroid = true;
         else if (arg == "--n-batch" && need("--n-batch")) a.n_batch = std::atoi(argv[++i]);
         else if (arg == "--orchestrator-recency-only") a.orchestrator_recency_only = true;
@@ -335,6 +338,12 @@ int main(int argc, char ** argv) {
             mode_b_ctx.reset();
         } else {
             mode_b_ctx->attach_model(model);
+            // KNOWN BUG (2026-05-04): set_graceful_mask AFTER init leaves the
+            // valid_mask tensor in init's hard-mask state, silently constraining
+            // the gate to the first n_slot experts. Set BEFORE init breaks the
+            // n_slot=40 30B path (gate degenerates to "Why is the sky blue?"
+            // repeats). Workaround: keep the hard-mask constraint for now —
+            // model uses fewer experts but produces coherent output.
             mode_b_ctx->set_graceful_mask(args.mode_b_graceful);
             moe_orch::set_mode_b_context(mode_b_ctx.get());
             std::printf("[stage7] Mode B context active for graph build (graceful_mask=%s)\n",
@@ -415,10 +424,12 @@ int main(int argc, char ** argv) {
     cparams.n_batch     = args.n_batch;
     cparams.n_threads   = args.n_threads;
     cparams.n_threads_batch = args.n_threads;
-    if (orchestrator) {
+    if (orchestrator && !std::getenv("MOE_DISABLE_CB_EVAL")) {
         cparams.cb_eval           = ggml_eval_callback_orchestrator;
         cparams.cb_eval_user_data = orchestrator.get();
         std::printf("Eval callback wired to orchestrator.\n");
+    } else if (std::getenv("MOE_DISABLE_CB_EVAL")) {
+        std::printf("[stage7] cb_eval bridge DISABLED (MOE_DISABLE_CB_EVAL=1) — pure static-partition Mode B\n");
     }
 
     llama_context * ctx = llama_init_from_model(model, cparams);
@@ -485,7 +496,21 @@ int main(int argc, char ** argv) {
         // process the full prompt in one batch.
         const auto t_prefill_start = std::chrono::steady_clock::now();
         int chunk_size = n_tok;
-        if (args.mode_b_graceful && mode_b_ctx) {
+        // Diagnostic env var: override chunk_size to test prefill speed at
+        // larger batch sizes. Useful when gate is effectively hard-masked
+        // (no swap pressure) so the conservative formula is overkill.
+        const char * chunk_env = std::getenv("MOE_CHUNK_SIZE");
+        bool chunk_overridden = false;
+        if (chunk_env) {
+            int forced = std::atoi(chunk_env);
+            if (forced > 0) {
+                chunk_size = std::min(chunk_size, forced);
+                chunk_size = std::min(chunk_size, args.n_batch);
+                std::printf("[stage7] chunk_size override: %d\n", chunk_size);
+                chunk_overridden = true;
+            }
+        }
+        if (!chunk_overridden && args.mode_b_graceful && mode_b_ctx) {
             // For graceful_mask correctness: at most n_slot/2/top_k tokens per
             // batch so that selected (chunk*top_k) fits in HALF the slots,
             // leaving the other half as safe evict targets when sync-swap
@@ -572,6 +597,152 @@ int main(int argc, char ** argv) {
         latencies.push_back(std::move(lat));
         return true;
     };
+
+    // ---- Chat REPL (commit #18) ----
+    // Multi-turn chat using llama_chat_apply_template + KV-cache continuation.
+    // Each turn: read user line from stdin, append to message history, apply
+    // the model's chat template to get the formatted text, tokenize the *new*
+    // suffix only (relative to last n_past), feed to llama_decode, generate
+    // until end-of-turn token. KV cache accumulates across turns.
+    auto run_chat_repl = [&]() -> int {
+        const char * tmpl = llama_model_chat_template(model, nullptr);
+        if (!tmpl) {
+            std::fprintf(stderr, "[chat] model has no built-in chat template; can't chat\n");
+            return 1;
+        }
+        std::printf("\n=== chat mode (type 'exit' or Ctrl-D to quit) ===\n");
+        std::printf("Model template: %s\n\n",
+                    std::string(tmpl).substr(0, 60).c_str());
+
+        struct Msg { std::string role; std::string content; };
+        std::vector<Msg> history;
+        // Optional system prompt
+        history.push_back({"system", "You are a helpful assistant."});
+
+        std::string formatted_prev;  // prior turn's full formatted prompt (for diff)
+        int n_past = 0;              // tokens already in KV cache
+
+        std::fprintf(stderr, "[chat-dbg] entering REPL loop\n");
+        std::string user_line;
+        while (true) {
+            std::printf("\nuser> ");
+            std::fflush(stdout);
+            std::fprintf(stderr, "[chat-dbg] waiting for getline\n");
+            if (!std::getline(std::cin, user_line)) {
+                std::fprintf(stderr, "[chat-dbg] getline returned false (EOF)\n");
+                break;
+            }
+            std::fprintf(stderr, "[chat-dbg] got line: '%s'\n", user_line.c_str());
+            if (user_line == "exit" || user_line == "quit") break;
+            if (user_line.empty()) continue;
+
+            std::fprintf(stderr, "[chat-dbg] history size before push: %zu\n", history.size());
+            history.push_back({"user", user_line});
+            std::fprintf(stderr, "[chat-dbg] history size after push: %zu\n", history.size());
+
+            // Apply chat template to entire history; want formatted prompt
+            // ending with the assistant-turn-start marker so model continues
+            // from there.
+            std::vector<llama_chat_message> msgs;
+            msgs.reserve(history.size());
+            for (const auto & m : history) {
+                msgs.push_back({m.role.c_str(), m.content.c_str()});
+            }
+            std::vector<char> buf(8192);
+            int needed = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(),
+                                                   /*add_ass=*/true, buf.data(), (int)buf.size());
+            if (needed > (int)buf.size()) {
+                buf.resize(needed + 1);
+                needed = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(),
+                                                   true, buf.data(), (int)buf.size());
+            }
+            std::fprintf(stderr, "[chat-dbg] template apply returned %d\n", needed);
+            if (needed < 0) { std::fprintf(stderr, "[chat] template apply failed\n"); break; }
+            std::string formatted(buf.data(), needed);
+            std::fprintf(stderr, "[chat-dbg] formatted length=%zu\n", formatted.size());
+
+            // Compute the SUFFIX added since last turn (the new tokens to feed).
+            std::string suffix = (formatted_prev.empty() || formatted.size() <= formatted_prev.size())
+                                 ? formatted
+                                 : formatted.substr(formatted_prev.size());
+
+            // Tokenize the suffix
+            std::fprintf(stderr, "[chat-dbg] suffix length=%zu, tokenizing\n", suffix.size());
+            std::vector<llama_token> new_tokens(suffix.size() + 16);
+            int n_new = llama_tokenize(vocab, suffix.c_str(), (int)suffix.size(),
+                                        new_tokens.data(), (int)new_tokens.size(),
+                                        /*add_special=*/(n_past == 0), /*parse_special=*/true);
+            std::fprintf(stderr, "[chat-dbg] tokenize returned %d\n", n_new);
+            if (n_new < 0) { std::fprintf(stderr, "[chat] tokenize failed\n"); break; }
+            new_tokens.resize(n_new);
+
+            // Feed prefill in chunks (same chunking logic as run_one_prompt)
+            int chunk_size = n_new;
+            if (args.mode_b_graceful && mode_b_ctx) {
+                const int top_k = 8;
+                const int safe_per_batch = std::max(1, args.l1_capacity / (2 * top_k));
+                chunk_size = std::min(chunk_size, safe_per_batch);
+                chunk_size = std::min(chunk_size, args.n_batch);
+            }
+            std::fprintf(stderr, "[chat-dbg] prefill: chunk_size=%d, n_new=%d\n", chunk_size, n_new);
+            for (int pos = 0; pos < n_new; pos += chunk_size) {
+                const int len = std::min(chunk_size, n_new - pos);
+                std::fprintf(stderr, "[chat-dbg] prefill chunk pos=%d len=%d\n", pos, len);
+                if (llama_decode(ctx, llama_batch_get_one(new_tokens.data() + pos, len))) {
+                    std::fprintf(stderr, "[chat] prefill failed\n"); return 1;
+                }
+                if (mode_b_ctx) mode_b_ctx->refresh_slots();
+            }
+            n_past += n_new;
+            std::fprintf(stderr, "[chat-dbg] prefill done, n_past=%d\n", n_past);
+
+            // Generate assistant response (greedy until EOG or n_predict cap)
+            std::printf("\nassistant> "); std::fflush(stdout);
+            std::string response;
+            for (int i = 0; i < args.n_predict; i++) {
+                const float * logits = llama_get_logits_ith(ctx, -1);
+                int n_vocab = llama_vocab_n_tokens(vocab);
+                llama_token best = 0;
+                float best_l = logits[0];
+                for (int t = 1; t < n_vocab; t++) {
+                    if (logits[t] > best_l) { best_l = logits[t]; best = t; }
+                }
+                if (llama_vocab_is_eog(vocab, best)) break;
+
+                char piece[128];
+                int n = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, true);
+                if (n > 0) {
+                    response.append(piece, n);
+                    std::fwrite(piece, 1, n, stdout); std::fflush(stdout);
+                }
+                if (llama_decode(ctx, llama_batch_get_one(&best, 1))) {
+                    std::fprintf(stderr, "[chat] decode failed\n"); return 1;
+                }
+                if (mode_b_ctx) mode_b_ctx->refresh_slots();
+                n_past++;
+            }
+            std::printf("\n");
+            history.push_back({"assistant", response});
+            formatted_prev = formatted + response;
+        }
+        std::printf("\nbye!\n");
+        return 0;
+    };
+
+    if (args.chat_mode) {
+        int rc = run_chat_repl();
+        if (orchestrator) {
+            auto s = orchestrator->cache_stats();
+            std::printf("\n=== Orchestrator cache stats - %s ===\n", mode_label);
+            std::printf("L1 hits:           %llu\n", (unsigned long long)s.hits_L1);
+            std::printf("L2 hits:           %llu\n", (unsigned long long)s.hits_L2);
+            std::printf("L3 misses:         %llu\n", (unsigned long long)s.misses_L3);
+            std::printf("L1 hit rate:       %.3f\n", s.l1_hit_rate);
+        }
+        moe_orch::set_mode_b_context(nullptr);
+        llama_free(ctx); llama_model_free(model);
+        return rc;
+    }
 
     // Build prompt list. If --prompts-file is set, read one prompt per non-empty
     // line; otherwise the single -p prompt.

@@ -438,23 +438,46 @@ extern "C" bool ggml_eval_callback_orchestrator(
     bool                 ask,
     void *               user_data) {
 
+    // Diagnostic env vars (preserved for follow-up perf work):
+    //   MOE_BRIDGE_NOOP=1 — bridge returns false always, no splits, no work.
+    //     Fast (matches no-cb-eval baseline) but produces wrong output.
+    //   MOE_BRIDGE_SPLIT_NO_WORK=1 — splits enabled but side effects skipped.
+    //     Also fast and wrong. Confirms side-effect work (not splits) is essential.
+    //   MOE_DISABLE_CB_EVAL=1 — set in main.cpp; equivalent to MOE_BRIDGE_NOOP.
+    // Per-token bridge overhead: ~280ms (sched syncs + tensor_gets).
+    // For 235B-class models this is the dominant cost; future work to batch
+    // tensor_gets / move processing async.
+    if (std::getenv("MOE_BRIDGE_NOOP")) return false;
+    if (std::getenv("MOE_BRIDGE_SPLIT_NO_WORK")) {
+        const char * name = ggml_get_name(t);
+        if (!name) return false;
+        bool match = std::strncmp(name, "ffn_moe_topk-", 13) == 0
+                  || std::strncmp(name, "ffn_moe_weights-", 16) == 0
+                  || std::strncmp(name, "ffn_norm-", 9) == 0;
+        if (!match) return false;
+        return true;
+    }
+
     const char * name = ggml_get_name(t);
     if (!name) return false;
 
-    // Two prefixes we care about:
-    //   ffn_moe_topk-N        → int32 indices (n_expert_used, n_tokens)
-    //   ffn_moe_weights-N     → fp32 raw router weights, same shape (well, with
-    //                           a leading 1: (1, n_expert_used, n_tokens))
+    // Prefixes we care about:
+    //   ffn_moe_topk-N            → int32 indices (n_expert_used, n_tokens) — full top-k
+    //   ffn_moe_tile_<T>_topk-N   → int32 indices (tile_size, n_tokens) — per-tile slice (commit #13c)
+    //   ffn_moe_weights-N         → fp32 raw router weights, same shape (well, with
+    //                               a leading 1: (1, n_expert_used, n_tokens))
     // We deliberately do NOT match ffn_moe_weights_softmax / _norm / _scaled —
     // their relative ordering is preserved through monotonic transforms, and
     // matching only "ffn_moe_weights-" (with the trailing dash) is exact.
-    const bool is_topk    = std::strncmp(name, "ffn_moe_topk-",    13) == 0;
-    const bool is_weights = std::strncmp(name, "ffn_moe_weights-", 16) == 0;
+    const bool is_topk      = std::strncmp(name, "ffn_moe_topk-",    13) == 0;
+    const bool is_tile_topk = std::strncmp(name, "ffn_moe_tile_",    13) == 0
+                              && std::strstr(name, "_topk-") != nullptr;
+    const bool is_weights   = std::strncmp(name, "ffn_moe_weights-", 16) == 0;
     // ffn_norm-N is the post-attention-norm output that feeds the router. This
     // matches the Python `Qwen3MoeSparseMoeBlock` pre-hook semantics — same
     // hidden state the predictor was trained against.
     const bool is_ffn_norm = std::strncmp(name, "ffn_norm-", 9) == 0;
-    if (!is_topk && !is_weights && !is_ffn_norm) return false;
+    if (!is_topk && !is_tile_topk && !is_weights && !is_ffn_norm) return false;
 
     if (ask) return true;
 
@@ -486,7 +509,42 @@ extern "C" bool ggml_eval_callback_orchestrator(
                 // selected expert IS in a slot before the FFN op consumes
                 // slot_map. Stream-ordered tensor_set guarantees the GPU sees
                 // updated slot_map before the next op reads it.
-                mb->on_gate_fired_sync(layer, host.data(), n_elements);
+                //
+                // When tiling is active (#13b/#13c), the per-tile cbs handle
+                // the swap incrementally and the full top-k > n_slot can't
+                // be sync-swapped in one shot anyway. Skip in that case.
+                // Policy lives in ModeBContext so build_moe_ffn and this
+                // bridge agree on whether tiling fires.
+                if (mb->n_tiles_for_top_k(top_k) <= 1) {
+                    mb->on_gate_fired_sync(layer, host.data(), n_elements);
+                }
+            }
+        }
+        return true;
+    }
+
+    if (is_tile_topk) {
+        // Name format: ffn_moe_tile_<T>_topk-<L>.
+        // Skip "ffn_moe_tile_" (13 chars), atoi tile index, find "_topk-",
+        // skip that (6 chars) and atoi layer index.
+        const char * after_prefix = name + 13;
+        int32_t tile_idx = std::atoi(after_prefix);
+        const char * topk_pos = std::strstr(after_prefix, "_topk-");
+        if (!topk_pos) return false;
+        int32_t layer = std::atoi(topk_pos + 6);
+        // Shape: (tile_size, n_tokens). Same int32 layout as full ffn_moe_topk.
+        const int32_t n_elements = (int32_t)ggml_nelements(t);
+        if (n_elements <= 0) return false;
+        std::vector<int32_t> host(n_elements);
+        ggml_backend_tensor_get(t, host.data(), 0, n_elements * sizeof(int32_t));
+        // Per-tile sync swap. Operates on this tile's experts only; eviction
+        // policy treats prior tiles' experts as safe (their FFN output is
+        // already in the cross-tile accumulator). Cache stats / on_routing
+        // intentionally skipped here — the full ffn_moe_topk-N cb already
+        // recorded the routing decision once.
+        if (auto * mb = moe_orch::get_mode_b_context()) {
+            if (mb->active()) {
+                mb->on_tile_fired_sync(layer, tile_idx, host.data(), n_elements);
             }
         }
         return true;

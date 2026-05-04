@@ -934,7 +934,7 @@ int ModeBContext::promote_to_tier2(int layer, const int32_t * experts, int count
 
 int ModeBContext::on_gate_fired_sync(int layer, const int32_t * experts, int count) {
     if (layer < 0 || layer >= (int)layers_.size()) return 0;
-    if (!graceful_mask_) return 0;  // no-op if hard mask is on; gate is constrained
+    if (!graceful_mask_) return 0;  // hard-mask constrains the gate; no swap needed
     auto & L = layers_[layer];
     if (!L.up_slots) return 0;
     if (count <= 0 || !experts) return 0;
@@ -1029,6 +1029,41 @@ int ModeBContext::on_gate_fired_sync(int layer, const int32_t * experts, int cou
     total_sync_swaps_ += (uint64_t)swaps;
     total_pages_in_   += (uint64_t)swaps;
     return swaps;
+}
+
+int ModeBContext::tile_size_for_top_k(int top_k) const {
+    if (top_k <= 0) return 0;
+    // Diagnostic env var: force tiling even when slots have headroom. Useful
+    // for isolating whether n_tiles>1 graph topology is broken vs swap pressure.
+    // KNOWN BUG (2026-05-04): n_tiles>1 produces garbage output (see handoff).
+    if (const char * env = std::getenv("MOE_FORCE_TILE_SIZE")) {
+        int forced = std::atoi(env);
+        if (forced > 0 && forced < top_k) return forced;
+    }
+    // Prefer init_dynamic's decision when populated (sizing_.tile_size > 0).
+    if (sizing_.tile_size > 0 && sizing_.tile_size < top_k) {
+        return sizing_.tile_size;
+    }
+    // Explicit init() with small n_slot: tile at n_slot.
+    if (n_slot_ > 0 && n_slot_ < top_k) {
+        return n_slot_;
+    }
+    return top_k;  // no tiling — slots can hold full top_k
+}
+
+int ModeBContext::n_tiles_for_top_k(int top_k) const {
+    const int ts = tile_size_for_top_k(top_k);
+    if (ts <= 0 || ts >= top_k) return 1;
+    return (top_k + ts - 1) / ts;
+}
+
+int ModeBContext::on_tile_fired_sync(int layer, int /*tile_idx*/,
+                                     const int32_t * experts, int count) {
+    // Same swap math as on_gate_fired_sync — the existing routine already
+    // builds safe-slots from "experts not in `selected`" semantics, which
+    // is correct per-tile when `selected` is just this tile's experts.
+    // tile_idx is reserved for future per-tile diagnostics / policy hooks.
+    return on_gate_fired_sync(layer, experts, count);
 }
 
 int ModeBContext::tier2_index(int layer, int expert) const {

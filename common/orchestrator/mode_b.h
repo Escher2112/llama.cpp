@@ -121,6 +121,17 @@ public:
     int n_expert() const { return n_expert_; }
     bool active() const { return ctx_ != nullptr && backend_buffer_ != nullptr; }
 
+    // ---- Commit #13b/#13c: tiling policy ----
+    //
+    // Authoritative source for "given a model's top_k, what tile_size and
+    // n_tiles do we use?" Both the graph builder (build_moe_ffn) and the
+    // orchestrator cb_eval bridge query these so they stay in sync.
+    //
+    // Policy: prefer init_dynamic's sizing decision if set; otherwise fall
+    // back to n_slot itself. Returns top_k (no tiling) when n_slot >= top_k.
+    int tile_size_for_top_k(int top_k) const;
+    int n_tiles_for_top_k(int top_k) const;
+
     // ---- Dynamic sizing decision (commit #13a) ----
     //
     // Output of init_dynamic(). Carried for diagnostics + the user-facing
@@ -173,8 +184,15 @@ public:
     // active, by fast PCIe swap from the pinned buffer. Pairs with the
     // orchestrator's Hopfield-driven mark_predicted to keep the resident set
     // hot ahead of the gate's actual decisions.
+    // NOTE: set_graceful_mask only updates the in-memory flag — the per-layer
+    // valid_mask tensors are written by init() based on graceful_mask_ at the
+    // time of init. If you need runtime-toggled graceful mode, set this BEFORE
+    // calling init(). Calling it after init() leaves the tensors in their
+    // init-time state (in practice the gate stays constrained to the experts
+    // cached at init).
     void set_graceful_mask(bool g) { graceful_mask_ = g; }
     bool graceful_mask() const     { return graceful_mask_; }
+
 
     // Populate the slot_map tensor for `layer` from a host-side int32 array
     // of length n_expert (entries are slot indices in [0, n_slot)). Wraps
@@ -280,6 +298,22 @@ public:
     //
     // Returns the number of synchronous page-ins performed.
     int on_gate_fired_sync(int layer, const int32_t * experts, int count);
+
+    // ---- Commit #13c: per-tile synchronous swap ----
+    //
+    // Called from the cb_eval bridge when ffn_moe_tile_<T>_topk-<L> fires
+    // (one tile of the gate's top-k slice). Same swap math as
+    // on_gate_fired_sync, applied to this tile's experts only. Eviction
+    // treats experts NOT in this tile's selected set as safe — including
+    // prior tiles' experts (their FFN output is already in the cross-tile
+    // accumulator from build_moe_ffn) and uncached experts. Future tiles'
+    // experts that happen to be cached may be evicted; worst case they're
+    // re-paged from Tier 2 next tile, which is cheap on pinned PCIe.
+    //
+    // tile_idx is currently informational (logged via diagnostics); the
+    // swap math doesn't depend on it.
+    int on_tile_fired_sync(int layer, int tile_idx,
+                           const int32_t * experts, int count);
 
     // Diagnostics
     uint64_t total_pages_in() const { return total_pages_in_; }

@@ -11,11 +11,14 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "../common/orchestrator/mode_b.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <string>
 #include <unordered_set>
 
 // dedup helpers
@@ -1507,7 +1510,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // (non-identity) slot maps produce wrong routing weights → garbage output
     // even with the right slots paged in.
     ggml_tensor * selected_experts_orig = selected_experts;
+
+    // ---- #13b/#13c tiling decision (must happen before the slot_map remap) ----
+    // When n_tiles > 1, the slot_map remap moves INSIDE the tile loop so it
+    // reads the per-tile-updated slot_map (after on_tile_fired_sync writes).
+    // When n_tiles == 1, keep the upfront remap to preserve byte-identity
+    // with the pre-#13b graph topology.
+    int tile_size = (int) n_expert_used;
+    int n_tiles   = 1;
     if (slot_map != nullptr) {
+        const auto * mb = moe_orch::get_mode_b_context();
+        if (mb && mb->active()) {
+            tile_size = mb->tile_size_for_top_k((int) n_expert_used);
+            n_tiles   = mb->n_tiles_for_top_k((int) n_expert_used);
+            // Diagnostic env var: limit tiling to first N layers. Per-layer
+            // probe (Chris's insight 2026-05-04) showed the n_tiles>1 bug
+            // introduces a small per-layer numerical error that compounds
+            // across 48 layers into total garbage. Tile only layer 0 to see
+            // a single layer's perturbation in isolation.
+            if (const char * env = std::getenv("MOE_DEBUG_TILE_LAYER_LIMIT")) {
+                int limit = std::atoi(env);
+                if (limit >= 0 && il >= limit) {
+                    tile_size = (int) n_expert_used;
+                    n_tiles   = 1;
+                }
+            }
+        }
+    }
+
+    if (slot_map != nullptr && n_tiles == 1) {
         ggml_tensor * smap_b = ggml_reshape_3d(ctx0, slot_map, 1, n_expert, 1);
         smap_b = ggml_repeat_4d(ctx0, smap_b, 1, n_expert, n_tokens, 1);
         ggml_tensor * remapped = ggml_get_rows(ctx0, smap_b, selected_experts);
@@ -1570,6 +1601,63 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
     }
+
+    // ---- Mode B tiled FFN (commit #13b/#13c) ----
+    // tile_size / n_tiles were decided above (right after argsort). When
+    // n_tiles == 1 the upfront slot_map remap already ran on selected_experts;
+    // this loop is a single pass that is byte-identical to the pre-#13b
+    // path. When n_tiles > 1, the upfront remap was skipped — each tile
+    // slices selected_experts_orig (expert-IDs), fires the per-tile cb
+    // (which triggers on_tile_fired_sync to update slot_map), THEN does
+    // the per-tile slot_map remap so the matmul reads the post-swap slots.
+    // The cross-tile ggml_add chain on moe_out_acc enforces topo order.
+    ggml_tensor * selected_experts_orig_full = selected_experts_orig;
+    ggml_tensor * weights_full               = weights;
+    ggml_tensor * cur_full                   = cur;
+
+    ggml_tensor * moe_out_acc = nullptr;
+
+    for (int t = 0; t < n_tiles; ++t) {
+        const int t_off = t * tile_size;
+        const int t_n   = std::min(tile_size, (int) n_expert_used - t_off);
+
+        // Restore cur at the top of every tile — the FFN body reassigns it
+        // (gate matmul, swiglu, etc.), so without restoration tile T+1 would
+        // start with stale [n_ff, t_n, n_tokens] instead of [n_embd, 1, n_tokens].
+        cur = cur_full;
+
+        if (n_tiles > 1) {
+            // Per-tile expert-ID slice (materialize via cont — small int32 copy,
+            // ensures mul_mat_id / get_rows see contiguous inputs on all backends).
+            ggml_tensor * sel_orig_view = ggml_view_2d(ctx0, selected_experts_orig_full,
+                                                       t_n, n_tokens,
+                                                       selected_experts_orig_full->nb[1],
+                                                       t_off * selected_experts_orig_full->nb[0]);
+            selected_experts_orig = ggml_cont_2d(ctx0, sel_orig_view, t_n, n_tokens);
+
+            // CB tag fires the per-tile sync swap (orchestrator updates
+            // slot_map for THIS tile's experts via on_tile_fired_sync).
+            // Carried on the expert-ID tensor so the orchestrator gets
+            // gate-truth IDs, not stale slot indices.
+            const std::string tile_tag = "ffn_moe_tile_" + std::to_string(t) + "_topk";
+            cb(selected_experts_orig, tile_tag.c_str(), il);
+
+            // Per-tile slot_map remap. CUDA stream order serializes the
+            // tensor_set writes from on_tile_fired_sync before this get_rows
+            // executes, so it sees the freshly-updated slot_map.
+            ggml_tensor * smap_b = ggml_reshape_3d(ctx0, slot_map, 1, n_expert, 1);
+            smap_b = ggml_repeat_4d(ctx0, smap_b, 1, n_expert, n_tokens, 1);
+            ggml_tensor * remapped = ggml_get_rows(ctx0, smap_b, selected_experts_orig);
+            selected_experts = ggml_reshape_2d(ctx0, remapped, t_n, n_tokens);
+            cb(selected_experts, "ffn_moe_tile_topk_slotmapped", il);
+
+            // Per-tile weights slice
+            ggml_tensor * w_view = ggml_view_3d(ctx0, weights_full,
+                                                1, t_n, n_tokens,
+                                                weights_full->nb[1], weights_full->nb[2],
+                                                t_off * weights_full->nb[1]);
+            weights = ggml_cont_3d(ctx0, w_view, 1, t_n, n_tokens);
+        }
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
@@ -1734,26 +1822,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
-    assert(n_expert_used > 0);
+    assert(t_n > 0);
 
     // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    for (int i = 0; i < t_n; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
+    // aggregate experts within this tile.
+    // For n_tiles == 1 this is the original (pre-#13b) full aggregation:
+    // t_n == n_expert_used, same view count and same ggml_add chain ⇒
+    // byte-identical graph topology to the path that motivated PR #14753.
+    ggml_tensor * tile_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+    for (int i = 1; i < t_n; ++i) {
+        tile_out = ggml_add(ctx0, tile_out, cur_experts[i]);
 
-        ggml_build_forward_expand(gf, moe_out);
+        ggml_build_forward_expand(gf, tile_out);
     }
+
+    // Accumulate this tile into moe_out_acc. The cross-tile ggml_add chain
+    // forces topo-order serialization: tile T+1 cannot start its matmuls
+    // until tile T's tile_out has been computed, which is what guarantees
+    // per-tile slot updates (commit #13c) land before the next tile reads
+    // slot_map.
+    if (moe_out_acc == nullptr) {
+        moe_out_acc = tile_out;
+    } else {
+        moe_out_acc = ggml_add(ctx0, moe_out_acc, tile_out);
+        ggml_build_forward_expand(gf, moe_out_acc);
+    }
+
+    } // end tile loop (commit #13b)
+
+    ggml_tensor * moe_out = moe_out_acc;
 
     if (hparams.n_expert_used == 1) {
         // avoid returning a non-contiguous tensor
